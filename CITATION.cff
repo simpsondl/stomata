@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+message: "If you use Cystidia, please cite it as below."
+title: "Cystidia: GPU-accelerated exhaustive CRISPR off-target search"
+type: software
+authors:
+  - given-names: Daniel L.
+    family-names: Simpson
+    affiliation: "New York Genome Center"
+  - given-names: Neville E.
+    family-names: Sanjana
+    affiliation: "New York Genome Center"
+  - given-names: Tuuli
+    family-names: Lappalainen
+license: MIT
+version: 0.5.0
+date-released: 2026-04-19
+repository-code: https://github.com/simpsondl/cystidia
+keywords:
+  - CRISPR
+  - off-target
+  - GPU
+  - bioinformatics
+  - guide RNA

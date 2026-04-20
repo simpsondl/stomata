@@ -1,0 +1,9 @@
+build/
+.cache/
+*.o
+*.a
+*.so
+*.swp
+.DS_Store
+
+tests/data/synthetic/*.cy

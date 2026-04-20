@@ -1,0 +1,12 @@
+# Test spacers for batch mode
+# Format: name<TAB>sequence or just sequence
+
+# Unnamed spacer (will be auto-named spacer_1)
+ACGTACGT
+
+# Named spacers
+test_spacer_1	AAAACCCCGGGGTTTT
+test_spacer_2	TTTTGGGGCCCCAAAA	NGG
+
+# This spacer should match the beginning of chr1 in test_small.fa
+chr1_match	ACGTACGTACGTACGT

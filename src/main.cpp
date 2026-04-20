@@ -1,0 +1,739 @@
+#include <genome_loader.hpp>
+#include <search_pipeline.hpp>
+#include <gpu_engine.hpp>
+
+#include <algorithm>
+#include <cctype>
+#include <chrono>
+#include <cstring>
+#include <fstream>
+#include <functional>
+#include <initializer_list>
+#include <iostream>
+#include <memory>
+#include <string>
+#include <vector>
+
+// Usage / Help
+
+static void print_usage(const char* program_name) {
+    std::cout << "Usage: " << program_name << " [OPTIONS]\n"
+              << "\n"
+              << "Cystidia - Exhaustive CRISPR off-target search engine\n"
+              << "\n"
+              << "Required arguments (one of):\n"
+              << "  --pattern PATTERN        Nucleotide pattern to search for (ACGTNacgtn)\n"
+              << "  --spacer-file FILE       File with spacer sequences (one per line; use '-' for stdin)\n"
+              << "  --index-genome FILE      Create .cy index from FASTA (no search)\n"
+              << "  --genome FILE            Path to genome FASTA or .cy index file\n"
+              << "\n"
+              << "Optional arguments:\n"
+              << "  --region REGION          Restrict search to CHR or CHR:START-END (1-based, inclusive-exclusive)\n"
+              << "  --threshold N            Maximum edit distance to report (default: 4)\n"
+              << "  --distance-mode MODE     Distance metric: levenshtein (default) or hamming\n"
+              << "  --format FORMAT          Output format: tsv (default), bed, or json\n"
+              << "  --output FILE            Write results to FILE instead of stdout\n"
+              << "  --cpu-only               Force CPU computation (no GPU)\n"
+              << "\n"
+              << "Strand control:\n"
+              << "  --strand MODE            Strand selection (default: both):\n"
+              << "                             both   run both passes; report + and -\n"
+              << "                             plus   run only the forward pass; only + hits\n"
+              << "                             minus  run only the RC pass; only - hits\n"
+              << "\n"
+              << "PAM filtering:\n"
+              << "  --pam-filter FILTER      Filter by PAM type: none (default), ngg, nag, both, any\n"
+              << "  --compute-mismatches     Compute mismatch details (default: true)\n"
+              << "  --no-compute-mismatches  Skip mismatch computation\n"
+              << "\n"
+              << "Activity scoring:\n"
+              << "  --compute-scores         Compute CFD activity scores (default: true)\n"
+              << "  --no-scores              Disable CFD scoring for faster output\n"
+              << "  --mit-score              Compute MIT specificity scores in batch mode\n"
+              << "\n"
+              << "Performance options:\n"
+              << "  --threads N, -t N        Number of threads for batch processing (0 = auto)\n"
+              << "\n"
+              << "Input normalization:\n"
+              << "  --treat-u-as-t           Treat U (uracil) as T (thymine) in spacers (default: on)\n"
+              << "  --no-treat-u-as-t        Disable U→T normalization\n"
+              << "\n"
+              << "Output control:\n"
+              << "  --max-hits N             Limit output to first N hits per spacer (0 = unlimited)\n"
+              << "  --max-total-hits N       Batch mode: cap total hits across all spacers (0 = unlimited)\n"
+              << "  --summary                Output aggregated counts by distance instead of per-hit details\n"
+              << "  --summary-format FORMAT  Summary output format: json (default) or tsv\n"
+              << "  --verbose                Show detailed statistics on stderr\n"
+              << "  --quiet                  Suppress all non-error output on stderr\n"
+              << "\n"
+              << "Debug options:\n"
+              << "  --no-deduplicate         Disable halo deduplication (emits every Myers end-position hit)\n"
+              << "\n"
+              << "Information:\n"
+              << "  --help                   Show this help message and exit\n"
+              << "  --version                Show version information and exit\n"
+              << "\n"
+              << "Spacer file format:\n"
+              << "  # Lines starting with # are comments\n"
+              << "  GAGTCCGAGCAGAAGAAGAA           # Just sequence (auto-named spacer_1, ...)\n"
+              << "  EMX1    GAGTCCGAGCAGAAGAAGAA   # Name<TAB>Sequence\n"
+              << "  FANCF   GGAATCCCTTCTGCAGCACC   NGG   # Additional columns ignored\n"
+              << "\n"
+              << "Examples:\n"
+              << "  " << program_name << " --pattern ACGTACGTACGTACGTACGT --genome hg38.fa --threshold 4\n"
+              << "  " << program_name << " --spacer-file guides.txt --genome hg38.fa --threshold 4\n"
+              << "  " << program_name << " --pattern ACGTACGTACGTACGTACGT --genome hg38.fa --pam-filter both --max-hits 1000\n"
+              << "  " << program_name << " --index-genome hg38.fa                  # Creates hg38.fa.cy\n"
+              << "  " << program_name << " --genome hg38.fa.cy --pattern ...    # Uses mmap for fast load\n"
+              << "\n"
+              << "Distance modes:\n"
+              << "  levenshtein              Full edit distance (substitutions + indels) - default\n"
+              << "  hamming                  Substitution-only distance (no indels) - faster\n"
+              << "\n"
+              << "Notes:\n"
+              << "  - Pattern length must be 1-64 for GPU acceleration\n"
+              << "  - Patterns longer than 64 bp will use CPU (multi-word Myers)\n"
+              << "  - N in the pattern matches any nucleotide at zero cost\n"
+              << "  - PAM filtering requires --compute-mismatches (default on)\n"
+              << "  - Batch mode (--spacer-file) loads genome once for all spacers\n"
+              << "  - .cy index files are memory-mapped for instant loading\n"
+              << "  - Hamming mode is faster but does not account for insertions/deletions\n"
+              << "\n";
+}
+
+static void print_version() {
+    std::cout << "cystidia version " << CYSTIDIA_VERSION << "\n"
+              << "Built with GPU support: " << (gpu_available() ? "yes" : "no") << "\n";
+}
+
+// Argument parsing
+
+// Strand selection. Each non-default mode skips one search pass entirely so the
+// output naturally contains only hits on the requested strand:
+//   BOTH  - run both passes (default)
+//   PLUS  - run only the forward pass; all hits are on the + strand
+//   MINUS - run only the reverse-complement pass; all hits are on the - strand
+enum class StrandMode { BOTH, PLUS, MINUS };
+
+struct Arguments {
+    std::string pattern;
+    std::string spacer_file;   // Batch mode: file with spacer sequences
+    std::string genome_path;
+    std::string index_genome;  // Index creation mode: input FASTA path
+    std::string output_path;
+    std::string format = "tsv";
+    std::string pam_filter = "none";
+    std::string summary_format = "json";
+    std::string distance_mode = "levenshtein";  // Distance metric: levenshtein or hamming
+    int threshold = 4;
+    size_t max_hits = 0;
+    size_t max_total_hits = 0;  // Batch mode: global cap across all spacers (0 = unlimited)
+    std::string region;  // Optional search window: "chr" or "chr:start-end" (1-based, inclusive-exclusive in output)
+    bool cpu_only = false;
+    bool verbose = false;
+    bool quiet = false;
+    bool show_help = false;
+    bool show_version = false;
+    StrandMode strand_mode = StrandMode::BOTH;
+    bool compute_mismatches = true;
+    bool compute_scores = true;  // CFD activity scoring (default: on)
+    bool compute_mit_score = false;  // MIT specificity scoring (default: off, only for batch mode)
+    bool treat_u_as_t = true;   // Normalize U→T in spacer sequences (default: on)
+    bool summary_mode = false;  // Output aggregated counts instead of per-hit details
+    bool disable_deduplication = false;  // Skip halo dedup (cross-tool validation).
+    size_t num_threads = 0;  // 0 = auto (hardware_concurrency)
+};
+
+// Table-driven argument parser.
+//
+// Each OptionDef row binds a long flag (and optional alias) to an `apply`
+// lambda.  Value-taking options receive the raw next-argv token; flag options
+// receive nullptr.  The lambda returns false after printing an error to stderr
+// to abort parsing.
+
+namespace {
+
+struct OptionDef {
+    const char* name;
+    const char* alias;     // nullptr if none
+    bool takes_value;
+    std::function<bool(Arguments&, const char*)> apply;
+};
+
+// Store a non-negative integer parsed from `v`.  Used for --threshold,
+// --max-hits, --max-total-hits, --threads.
+bool parse_nonneg_int(const char* flag, const char* v, long long& out) {
+    try {
+        out = std::stoll(v);
+    } catch (const std::exception&) {
+        std::cerr << "Error: " << flag << " requires a numeric argument\n";
+        return false;
+    }
+    if (out < 0) {
+        std::cerr << "Error: " << flag << " must be non-negative\n";
+        return false;
+    }
+    return true;
+}
+
+std::string to_lower_copy(const char* v) {
+    std::string s = v;
+    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+
+// Whitelist-check a string value; print error + allowed list on failure.
+bool require_one_of(const char* flag, const std::string& got,
+                    std::initializer_list<const char*> allowed,
+                    const char* allowed_display) {
+    for (const char* a : allowed) if (got == a) return true;
+    std::cerr << "Error: " << flag << " must be " << allowed_display << "\n";
+    return false;
+}
+
+const std::vector<OptionDef>& option_table() {
+    static const std::vector<OptionDef> kOptions = {
+        {"--help", "-h", false, [](Arguments& a, const char*){ a.show_help = true; return true; }},
+        {"--version", "-v", false, [](Arguments& a, const char*){ a.show_version = true; return true; }},
+
+        {"--pattern",      nullptr, true, [](Arguments& a, const char* v){ a.pattern      = v; return true; }},
+        {"--spacer-file",  nullptr, true, [](Arguments& a, const char* v){ a.spacer_file  = v; return true; }},
+        {"--genome",       nullptr, true, [](Arguments& a, const char* v){ a.genome_path  = v; return true; }},
+        {"--index-genome", nullptr, true, [](Arguments& a, const char* v){ a.index_genome = v; return true; }},
+        {"--output",       nullptr, true, [](Arguments& a, const char* v){ a.output_path  = v; return true; }},
+        {"--region",       nullptr, true, [](Arguments& a, const char* v){ a.region       = v; return true; }},
+
+        {"--threshold", nullptr, true, [](Arguments& a, const char* v){
+            long long n; if (!parse_nonneg_int("--threshold", v, n)) return false;
+            a.threshold = static_cast<int>(n); return true;
+        }},
+        {"--max-hits", nullptr, true, [](Arguments& a, const char* v){
+            long long n; if (!parse_nonneg_int("--max-hits", v, n)) return false;
+            a.max_hits = static_cast<size_t>(n); return true;
+        }},
+        {"--max-total-hits", nullptr, true, [](Arguments& a, const char* v){
+            long long n; if (!parse_nonneg_int("--max-total-hits", v, n)) return false;
+            a.max_total_hits = static_cast<size_t>(n); return true;
+        }},
+        {"--threads", "-t", true, [](Arguments& a, const char* v){
+            long long n; if (!parse_nonneg_int("--threads", v, n)) return false;
+            a.num_threads = static_cast<size_t>(n); return true;
+        }},
+
+        {"--format", nullptr, true, [](Arguments& a, const char* v){
+            a.format = v;
+            return require_one_of("--format", a.format, {"tsv", "bed", "json"}, "'tsv', 'bed', or 'json'");
+        }},
+        {"--summary-format", nullptr, true, [](Arguments& a, const char* v){
+            a.summary_format = v;
+            return require_one_of("--summary-format", a.summary_format, {"json", "tsv"}, "'json' or 'tsv'");
+        }},
+        {"--distance-mode", nullptr, true, [](Arguments& a, const char* v){
+            a.distance_mode = to_lower_copy(v);
+            return require_one_of("--distance-mode", a.distance_mode, {"levenshtein", "hamming"}, "'levenshtein' or 'hamming'");
+        }},
+        {"--pam-filter", nullptr, true, [](Arguments& a, const char* v){
+            a.pam_filter = to_lower_copy(v);
+            return require_one_of("--pam-filter", a.pam_filter,
+                                  {"none", "ngg", "nag", "both", "any"},
+                                  "'none', 'ngg', 'nag', 'both', or 'any'");
+        }},
+        {"--strand", nullptr, true, [](Arguments& a, const char* v){
+            std::string s = to_lower_copy(v);
+            if (s == "both")       a.strand_mode = StrandMode::BOTH;
+            else if (s == "plus")  a.strand_mode = StrandMode::PLUS;
+            else if (s == "minus") a.strand_mode = StrandMode::MINUS;
+            else {
+                std::cerr << "Error: --strand must be 'both', 'plus', or 'minus'\n";
+                return false;
+            }
+            return true;
+        }},
+
+        {"--cpu-only", nullptr, false, [](Arguments& a, const char*){ a.cpu_only = true; return true; }},
+        {"--verbose",  nullptr, false, [](Arguments& a, const char*){ a.verbose  = true; return true; }},
+        {"--quiet",    nullptr, false, [](Arguments& a, const char*){ a.quiet    = true; return true; }},
+        {"--summary",  nullptr, false, [](Arguments& a, const char*){ a.summary_mode = true; return true; }},
+
+        {"--compute-mismatches",    nullptr, false, [](Arguments& a, const char*){ a.compute_mismatches = true;  return true; }},
+        {"--no-compute-mismatches", nullptr, false, [](Arguments& a, const char*){ a.compute_mismatches = false; return true; }},
+        {"--compute-scores",        nullptr, false, [](Arguments& a, const char*){ a.compute_scores = true;  return true; }},
+        {"--no-scores",             nullptr, false, [](Arguments& a, const char*){ a.compute_scores = false; return true; }},
+        {"--mit-score",             nullptr, false, [](Arguments& a, const char*){ a.compute_mit_score = true; return true; }},
+        {"--treat-u-as-t",          nullptr, false, [](Arguments& a, const char*){ a.treat_u_as_t = true;  return true; }},
+        {"--no-treat-u-as-t",       nullptr, false, [](Arguments& a, const char*){ a.treat_u_as_t = false; return true; }},
+        {"--no-deduplicate",        nullptr, false, [](Arguments& a, const char*){ a.disable_deduplication = true; return true; }},
+    };
+    return kOptions;
+}
+
+const OptionDef* find_option(const std::string& arg) {
+    for (const auto& opt : option_table()) {
+        if (arg == opt.name || (opt.alias && arg == opt.alias)) return &opt;
+    }
+    return nullptr;
+}
+
+}  // namespace
+
+static bool parse_arguments(int argc, char** argv, Arguments& args) {
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        const OptionDef* opt = find_option(arg);
+        if (!opt) {
+            std::cerr << "Error: Unknown argument: " << arg << "\n";
+            return false;
+        }
+
+        const char* value = nullptr;
+        if (opt->takes_value) {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: " << opt->name << " requires an argument\n";
+                return false;
+            }
+            value = argv[++i];
+        }
+
+        if (!opt->apply(args, value)) return false;
+
+        // Preserve prior short-circuit: --help / --version stop further parsing.
+        if (args.show_help || args.show_version) return true;
+    }
+    return true;
+}
+
+static bool validate_arguments(const Arguments& args) {
+    // Index creation mode: only --index-genome is required
+    bool index_mode = !args.index_genome.empty();
+    if (index_mode) {
+        // In index mode, we don't need --pattern, --spacer-file, or --genome
+        if (!args.pattern.empty() || !args.spacer_file.empty()) {
+            std::cerr << "Error: --index-genome cannot be combined with --pattern or --spacer-file\n";
+            return false;
+        }
+        if (!args.genome_path.empty()) {
+            std::cerr << "Error: --index-genome cannot be combined with --genome\n";
+            return false;
+        }
+        return true;
+    }
+
+    // Check that either --pattern or --spacer-file is provided (but not both)
+    bool has_pattern = !args.pattern.empty();
+    bool has_spacer_file = !args.spacer_file.empty();
+
+    if (!has_pattern && !has_spacer_file) {
+        std::cerr << "Error: --pattern or --spacer-file is required\n";
+        return false;
+    }
+
+    if (has_pattern && has_spacer_file) {
+        std::cerr << "Error: --pattern and --spacer-file are mutually exclusive\n";
+        return false;
+    }
+
+    if (args.genome_path.empty()) {
+        std::cerr << "Error: --genome is required\n";
+        return false;
+    }
+
+    // Validate pattern characters (only if using --pattern)
+    if (has_pattern) {
+        for (char c : args.pattern) {
+            switch (c) {
+                case 'A': case 'a':
+                case 'C': case 'c':
+                case 'G': case 'g':
+                case 'T': case 't':
+                case 'N': case 'n':
+                case 'U': case 'u':  // Accepted when treat_u_as_t is enabled
+                    break;
+                default:
+                    std::cerr << "Error: Invalid character in pattern: '" << c << "'\n";
+                    return false;
+            }
+        }
+        // Check U usage when normalization is disabled
+        if (!args.treat_u_as_t) {
+            for (char c : args.pattern) {
+                if (c == 'U' || c == 'u') {
+                    std::cerr << "Error: Pattern contains 'U' but --no-treat-u-as-t is set. "
+                              << "Use T instead of U, or enable U→T normalization.\n";
+                    return false;
+                }
+            }
+        }
+    }
+
+    // Validate PAM filter requires mismatch computation
+    if (args.pam_filter != "none" && args.pam_filter != "any" && !args.compute_mismatches) {
+        std::cerr << "Error: PAM filtering requires --compute-mismatches (default on)\n";
+        return false;
+    }
+
+    return true;
+}
+
+// Subcommand handlers
+
+static int run_index_mode(const Arguments& args) {
+    if (!args.quiet) {
+        std::cerr << "Creating index from: " << args.index_genome << "\n";
+    }
+
+    auto load_start = std::chrono::high_resolution_clock::now();
+    Genome genome = load_fasta(args.index_genome);
+    auto load_end = std::chrono::high_resolution_clock::now();
+
+    if (args.verbose) {
+        auto load_ms = std::chrono::duration_cast<std::chrono::milliseconds>(load_end - load_start).count();
+        std::cerr << "Parsed " << genome.total_bases << " bases from "
+                  << genome.chromosomes.size() << " chromosome(s) in "
+                  << load_ms << " ms\n";
+    }
+
+    std::string index_path = args.output_path.empty()
+                             ? args.index_genome + ".cy"
+                             : args.output_path;
+
+    auto write_start = std::chrono::high_resolution_clock::now();
+    write_genome_index(genome, index_path);
+    auto write_end = std::chrono::high_resolution_clock::now();
+
+    if (args.verbose) {
+        auto write_ms = std::chrono::duration_cast<std::chrono::milliseconds>(write_end - write_start).count();
+        std::cerr << "Wrote index to: " << index_path << " in " << write_ms << " ms\n";
+    } else if (!args.quiet) {
+        std::cerr << "Index created: " << index_path << "\n";
+    }
+
+    return 0;
+}
+
+// Resolve optional --region to absolute genome coordinates.
+// Accepts "chr" or "chr:start-end" (1-based, inclusive-exclusive end).
+// On success, sets region_start / region_end (both zero means "whole genome").
+// On parse or lookup failure, writes to stderr and returns false.
+static bool resolve_region(const Arguments& args, const GenomeView& view,
+                           size_t& region_start, size_t& region_end) {
+    region_start = 0;
+    region_end   = 0;
+    if (args.region.empty()) return true;
+
+    std::string chrom_name;
+    size_t range_start_1b = 1;
+    size_t range_end_1b = 0;
+    size_t colon = args.region.find(':');
+    if (colon == std::string::npos) {
+        chrom_name = args.region;
+    } else {
+        chrom_name = args.region.substr(0, colon);
+        std::string range_spec = args.region.substr(colon + 1);
+        size_t dash = range_spec.find('-');
+        if (dash == std::string::npos) {
+            std::cerr << "Error: --region must be CHR or CHR:START-END (got '" << args.region << "')\n";
+            return false;
+        }
+        try {
+            range_start_1b = std::stoull(range_spec.substr(0, dash));
+            range_end_1b   = std::stoull(range_spec.substr(dash + 1));
+        } catch (const std::exception&) {
+            std::cerr << "Error: --region range must be numeric (got '" << range_spec << "')\n";
+            return false;
+        }
+        if (range_start_1b < 1 || range_end_1b <= range_start_1b) {
+            std::cerr << "Error: --region range must be 1-based with END > START (got " << range_spec << ")\n";
+            return false;
+        }
+    }
+
+    const Chromosome* chrom = nullptr;
+    for (const auto& c : *view.chromosomes) {
+        if (c.name == chrom_name) { chrom = &c; break; }
+    }
+    if (!chrom) {
+        std::cerr << "Error: --region chromosome '" << chrom_name << "' not found in genome.\n";
+        std::cerr << "Available: ";
+        for (const auto& c : *view.chromosomes) std::cerr << c.name << " ";
+        std::cerr << "\n";
+        return false;
+    }
+
+    if (range_end_1b == 0) {
+        range_start_1b = 1;
+        range_end_1b = chrom->length + 1;
+    }
+    if (range_end_1b > chrom->length + 1) {
+        std::cerr << "Error: --region end " << range_end_1b << " exceeds " << chrom->name
+                  << " length " << chrom->length << "\n";
+        return false;
+    }
+
+    region_start = chrom->start + (range_start_1b - 1);
+    region_end   = chrom->start + (range_end_1b - 1);
+
+    if (args.verbose) {
+        std::cerr << "Region: " << chrom_name << ":" << range_start_1b << "-" << range_end_1b
+                  << " (absolute " << region_start << "-" << region_end << ")\n";
+    }
+    return true;
+}
+
+static PamFilter pam_filter_from_string(const std::string& s) {
+    if (s == "none") return PamFilter::NONE;
+    if (s == "ngg")  return PamFilter::NGG_ONLY;
+    if (s == "nag")  return PamFilter::NAG_ONLY;
+    if (s == "both") return PamFilter::NGG_OR_NAG;
+    return PamFilter::ANY;
+}
+
+static DistanceMode distance_mode_from_string(const std::string& s) {
+    return (s == "hamming") ? DistanceMode::HAMMING : DistanceMode::LEVENSHTEIN;
+}
+
+// Map StrandMode to the search-pipeline gates. PLUS skips the RC pass,
+// MINUS skips the forward pass; BOTH runs both. The output then naturally
+// contains only hits on the requested strand(s) — no post-filter needed.
+static bool forward_only_for(StrandMode mode) { return mode == StrandMode::PLUS; }
+static bool reverse_only_for(StrandMode mode) { return mode == StrandMode::MINUS; }
+
+static std::string run_batch_search(const Arguments& args, GenomeView view,
+                                    size_t region_start, size_t region_end) {
+    if (args.verbose) {
+        std::cerr << "Parsing spacer file: " << args.spacer_file << "\n";
+    }
+
+    auto spacers = parse_spacer_file(args.spacer_file);
+
+    if (args.treat_u_as_t) {
+        for (auto& spacer : spacers) {
+            spacer.sequence = normalize_uracil(spacer.sequence);
+        }
+    }
+
+    if (args.verbose) {
+        std::cerr << "Found " << spacers.size() << " spacer(s)\n";
+    }
+
+    BatchSearchConfig batch_config;
+    batch_config.spacers = std::move(spacers);
+    batch_config.threshold = static_cast<uint8_t>(args.threshold);
+    batch_config.prefer_gpu = !args.cpu_only;
+    batch_config.compute_mismatches = args.compute_mismatches;
+    batch_config.compute_scores = args.compute_scores;
+    batch_config.compute_mit_score = args.compute_mit_score;
+    batch_config.max_hits_per_spacer = args.max_hits;
+    batch_config.forward_only = forward_only_for(args.strand_mode);
+    batch_config.reverse_only = reverse_only_for(args.strand_mode);
+    batch_config.verbose = args.verbose;
+    batch_config.num_threads = args.num_threads;
+    batch_config.search_start = region_start;
+    batch_config.search_end   = region_end;
+    batch_config.distance_mode = distance_mode_from_string(args.distance_mode);
+    batch_config.pam_filter = pam_filter_from_string(args.pam_filter);
+
+    BatchSearchResult batch_result = search_genome_batch(batch_config, view);
+
+    // Apply global --max-total-hits cap (0 = unlimited). Hits are kept in
+    // per-spacer order; we truncate from the tail across spacers.
+    if (args.max_total_hits > 0 && batch_result.total_hits > args.max_total_hits) {
+        size_t remaining = args.max_total_hits;
+        size_t dropped = batch_result.total_hits - args.max_total_hits;
+        for (auto& sr : batch_result.spacer_results) {
+            if (remaining == 0) {
+                sr.result.hits.clear();
+            } else if (sr.result.hits.size() > remaining) {
+                sr.result.hits.resize(remaining);
+                remaining = 0;
+            } else {
+                remaining -= sr.result.hits.size();
+            }
+        }
+        batch_result.total_hits = args.max_total_hits;
+        if (!args.quiet) {
+            std::cerr << "Note: --max-total-hits cap applied; dropped " << dropped
+                      << " hits beyond the first " << args.max_total_hits << ".\n";
+        }
+    }
+
+    if (args.verbose) {
+        std::cerr << "Batch search completed in " << batch_result.total_time_ms << " ms\n";
+        std::cerr << "Used GPU: " << (batch_result.used_gpu ? "yes" : "no") << "\n";
+        std::cerr << "Total hits: " << batch_result.total_hits << "\n";
+    } else if (!args.quiet) {
+        std::cerr << "Total hits: " << batch_result.total_hits << "\n";
+    }
+
+    if (args.summary_mode) {
+        auto summary = summarize_batch_results(
+            batch_result, static_cast<uint8_t>(args.threshold));
+        return (args.summary_format == "tsv")
+            ? format_summary_tsv(summary)
+            : format_summary_json(summary);
+    }
+    if (args.format == "tsv")  return format_batch_hits_tsv(batch_result);
+    if (args.format == "json") return format_batch_hits_json(batch_result);
+    return format_batch_hits_bed(batch_result);
+}
+
+static std::string run_single_search(const Arguments& args, GenomeView view,
+                                     size_t region_start, size_t region_end) {
+    SearchConfig config;
+    config.pattern = args.treat_u_as_t ? normalize_uracil(args.pattern) : args.pattern;
+    config.threshold = static_cast<uint8_t>(args.threshold);
+    config.prefer_gpu = !args.cpu_only;
+    config.compute_mismatches = args.compute_mismatches;
+    config.compute_scores = args.compute_scores;
+    config.forward_only = forward_only_for(args.strand_mode);
+    config.reverse_only = reverse_only_for(args.strand_mode);
+    config.max_hits = args.max_hits;
+    config.disable_deduplication = args.disable_deduplication;
+    config.search_start = region_start;
+    config.search_end   = region_end;
+    config.distance_mode = distance_mode_from_string(args.distance_mode);
+    config.pam_filter = pam_filter_from_string(args.pam_filter);
+
+    if (args.verbose) {
+        const char* strand_str = (args.strand_mode == StrandMode::BOTH)  ? "both"
+                               : (args.strand_mode == StrandMode::PLUS)  ? "plus"
+                               :                                           "minus";
+        std::cerr << "Searching for pattern: " << config.pattern << "\n";
+        std::cerr << "Pattern length: " << config.pattern.size() << " bp\n";
+        std::cerr << "Threshold: " << static_cast<int>(config.threshold) << "\n";
+        std::cerr << "Strand: " << strand_str << "\n";
+        std::cerr << "Compute mismatches: " << (config.compute_mismatches ? "yes" : "no") << "\n";
+        std::cerr << "Compute CFD scores: " << (config.compute_scores ? "yes" : "no") << "\n";
+        std::cerr << "PAM filter: " << args.pam_filter << "\n";
+        if (config.max_hits > 0) {
+            std::cerr << "Max hits: " << config.max_hits << "\n";
+        }
+        std::cerr << "GPU available: " << (gpu_available() ? "yes" : "no") << "\n";
+        std::cerr << "GPU preferred: " << (config.prefer_gpu ? "yes" : "no") << "\n";
+    }
+
+    auto search_start = std::chrono::high_resolution_clock::now();
+    SearchResult result = search_genome(config, view);
+    auto search_end = std::chrono::high_resolution_clock::now();
+
+    if (args.verbose) {
+        auto search_ms = std::chrono::duration_cast<std::chrono::milliseconds>(search_end - search_start).count();
+        std::cerr << "Search completed in " << search_ms << " ms\n";
+        std::cerr << "Used GPU: " << (result.used_gpu ? "yes" : "no") << "\n";
+        std::cerr << "Positions scanned: " << result.total_positions << "\n";
+        std::cerr << "Hits found: " << result.hits.size() << "\n";
+    } else if (!args.quiet) {
+        std::cerr << "Hits found: " << result.hits.size() << "\n";
+    }
+
+    if (args.summary_mode) {
+        auto summary = summarize_single_result(result, args.pattern);
+        return (args.summary_format == "tsv")
+            ? format_summary_tsv(summary)
+            : format_summary_json(summary);
+    }
+    if (args.format == "tsv")  return format_hits_tsv(result.hits, config.pattern);
+    if (args.format == "json") return format_hits_json(result.hits, config.pattern);
+    return format_hits_bed(result.hits, config.pattern);
+}
+
+// Open the genome (auto-detect .cy for memory-mapped loading).
+// genome_ptr and mapped_ptr are out-params; exactly one will be populated.
+static GenomeView load_genome_auto(const Arguments& args,
+                                   std::unique_ptr<Genome>& genome_ptr,
+                                   std::unique_ptr<MappedGenome>& mapped_ptr) {
+    if (args.verbose) {
+        std::cerr << "Loading genome from: " << args.genome_path << "\n";
+    }
+
+    auto load_start = std::chrono::high_resolution_clock::now();
+    GenomeView view;
+
+    if (is_cystidia_index(args.genome_path)) {
+        mapped_ptr = std::make_unique<MappedGenome>(load_genome_index(args.genome_path));
+        view = make_view(*mapped_ptr);
+        if (args.verbose) {
+            auto load_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::high_resolution_clock::now() - load_start).count();
+            std::cerr << "Memory-mapped " << view.total_bases << " bases from "
+                      << view.chromosomes->size() << " chromosome(s) in "
+                      << load_ms << " ms\n";
+        }
+    } else {
+        genome_ptr = std::make_unique<Genome>(load_fasta(args.genome_path));
+        view = make_view(*genome_ptr);
+        if (args.verbose) {
+            auto load_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::high_resolution_clock::now() - load_start).count();
+            std::cerr << "Loaded " << view.total_bases << " bases from "
+                      << view.chromosomes->size() << " chromosome(s) in "
+                      << load_ms << " ms\n";
+        }
+    }
+    return view;
+}
+
+// Main
+
+int main(int argc, char** argv) {
+    Arguments args;
+
+    if (!parse_arguments(argc, argv, args)) {
+        std::cerr << "Run '" << argv[0] << " --help' for usage.\n";
+        return 1;
+    }
+
+    if (args.show_help)    { print_usage(argv[0]); return 0; }
+    if (args.show_version) { print_version();      return 0; }
+
+    if (!validate_arguments(args)) {
+        std::cerr << "Run '" << argv[0] << " --help' for usage.\n";
+        return 1;
+    }
+
+    auto start_time = std::chrono::high_resolution_clock::now();
+
+    try {
+        if (!args.index_genome.empty()) {
+            return run_index_mode(args);
+        }
+
+        std::unique_ptr<Genome> genome_ptr;
+        std::unique_ptr<MappedGenome> mapped_ptr;
+        GenomeView view = load_genome_auto(args, genome_ptr, mapped_ptr);
+
+        size_t region_start = 0, region_end = 0;
+        if (!resolve_region(args, view, region_start, region_end)) {
+            return 1;
+        }
+
+        std::string output = args.spacer_file.empty()
+            ? run_single_search(args, view, region_start, region_end)
+            : run_batch_search(args, view, region_start, region_end);
+
+        if (args.output_path.empty()) {
+            std::cout << output;
+        } else {
+            std::ofstream outfile(args.output_path);
+            if (!outfile) {
+                std::cerr << "Error: Could not open output file: " << args.output_path << "\n";
+                return 1;
+            }
+            outfile << output;
+            if (args.verbose) {
+                std::cerr << "Results written to: " << args.output_path << "\n";
+            }
+        }
+
+        if (args.verbose) {
+            auto end_time = std::chrono::high_resolution_clock::now();
+            auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+            std::cerr << "Total time: " << total_ms << " ms\n";
+        }
+
+        return 0;
+
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << "\n";
+        return 1;
+    }
+}
