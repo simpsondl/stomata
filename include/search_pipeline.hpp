@@ -115,7 +115,7 @@ struct SearchHit {
 // Configuration for a genome search.
 struct SearchConfig {
     std::string pattern;                          // The pattern to search for (nucleotide string)
-    uint8_t     threshold = 4;                    // Maximum edit distance to report (default: 4 for CRISPR)
+    uint8_t     threshold = 3;                    // Maximum edit distance to report (default: 3 for CRISPR)
     DistanceMode distance_mode = DistanceMode::LEVENSHTEIN;  // Distance metric: Levenshtein (default) or Hamming
     bool        prefer_gpu = true;                // Use GPU if available (falls back to CPU)
     bool        search_both_strands = true;       // Search forward and reverse complement
@@ -227,7 +227,7 @@ struct SpacerEntry {
 // Configuration for batch genome search.
 struct BatchSearchConfig {
     std::vector<SpacerEntry> spacers;             // All spacers to search
-    uint8_t     threshold = 4;                    // Maximum edit distance
+    uint8_t     threshold = 3;                    // Maximum edit distance
     DistanceMode distance_mode = DistanceMode::LEVENSHTEIN;  // Distance metric: Levenshtein (default) or Hamming
     bool        prefer_gpu = true;                // Use GPU if available
     bool        search_both_strands = true;       // Search both strands

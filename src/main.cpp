@@ -31,7 +31,7 @@ static void print_usage(const char* program_name) {
               << "\n"
               << "Optional arguments:\n"
               << "  --region REGION          Restrict search to CHR or CHR:START-END (1-based, inclusive-exclusive)\n"
-              << "  --threshold N            Maximum edit distance to report (default: 4)\n"
+              << "  --threshold N            Maximum edit distance to report (default: 3)\n"
               << "  --distance-mode MODE     Distance metric: levenshtein (default) or hamming\n"
               << "  --format FORMAT          Output format: tsv (default), bed, or json\n"
               << "  --output FILE            Write results to FILE instead of stdout\n"
@@ -90,8 +90,8 @@ static void print_usage(const char* program_name) {
               << "  FANCF   GGAATCCCTTCTGCAGCACC   NGG   # Additional columns ignored\n"
               << "\n"
               << "Examples:\n"
-              << "  " << program_name << " --pattern ACGTACGTACGTACGTACGT --genome hg38.fa --threshold 4\n"
-              << "  " << program_name << " --spacer-file guides.txt --genome hg38.fa --threshold 4\n"
+              << "  " << program_name << " --pattern ACGTACGTACGTACGTACGT --genome hg38.fa --threshold 3\n"
+              << "  " << program_name << " --spacer-file guides.txt --genome hg38.fa --threshold 3\n"
               << "  " << program_name << " --pattern ACGTACGTACGTACGTACGT --genome hg38.fa --pam NGG --max-hits 1000\n"
               << "  " << program_name << " --index-genome hg38.fa                  # Creates hg38.fa.cy\n"
               << "  " << program_name << " --genome hg38.fa.cy --pattern ...    # Uses mmap for fast load\n"
@@ -138,7 +138,7 @@ struct Arguments {
     size_t      pam_extract_length = 0;        // 0 = use pam_pattern length
     std::string summary_format = "json";
     std::string distance_mode = "levenshtein";  // Distance metric: levenshtein or hamming
-    int threshold = 4;
+    int threshold = 3;
     size_t max_hits = 0;
     size_t max_total_hits = 0;  // Batch mode: global cap across all spacers (0 = unlimited)
     std::string region;  // Optional search window: "chr" or "chr:start-end" (1-based, inclusive-exclusive in output)

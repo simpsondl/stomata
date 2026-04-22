@@ -4,6 +4,15 @@ All notable changes to Cystidia are documented here. Versioning follows semantic
 versioning (major.minor.patch). Kernel-correctness fixes may change result
 sets; these are called out in Bug fixes.
 
+## [0.6.1] — 2026-04-22
+
+### Changed
+
+- **Default `--threshold` is now 3** (was 4). 3 matches the convention used
+  by Cas-OFFinder, CRISPRitz, and the downstream CRISPR off-target literature
+  for SpCas9 analysis. Pass `--threshold 4` explicitly to preserve v0.6.0
+  behavior.
+
 ## [0.6.0] — 2026-04-22
 
 ### Added

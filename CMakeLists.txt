@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(Cystidia VERSION 0.6.0 LANGUAGES CXX CUDA)
+project(Cystidia VERSION 0.6.1 LANGUAGES CXX CUDA)
 
 # C++17 required
 # Use explicit compiler flags for C++ to avoid CMake's feature-mapping
