@@ -3,6 +3,7 @@
 #include <genome_loader.hpp>
 
 #include <algorithm>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -200,7 +201,6 @@ TEST_CASE("search_genome - exact match in chr1", "[search_pipeline][integration]
     config.pattern = "ACGTACGT";
     config.threshold = 0;         // Exact matches only
     config.prefer_gpu = false;    // Use CPU for deterministic testing
-    config.pam_filter = PamFilter::NONE;  // Disable PAM filtering for basic tests
 
     SearchResult result = search_genome(config, genome);
 
@@ -223,7 +223,6 @@ TEST_CASE("search_genome - single mismatch tolerance", "[search_pipeline][integr
     config.pattern = "ACGTACGT";
     config.threshold = 1;         // Up to 1 mismatch
     config.prefer_gpu = false;
-    config.pam_filter = PamFilter::NONE;  // Disable PAM filtering for basic tests
 
     SearchResult result = search_genome(config, genome);
 
@@ -264,7 +263,6 @@ TEST_CASE("search_genome - hits span multiple chromosomes", "[search_pipeline][i
     config.pattern = "ACGT";
     config.threshold = 1;
     config.prefer_gpu = false;
-    config.pam_filter = PamFilter::NONE;  // Disable PAM filtering for basic tests
 
     SearchResult result = search_genome(config, genome);
 
@@ -463,7 +461,6 @@ TEST_CASE("search_genome_batch - parallel produces same results as sequential",
     sequential_config.spacers = spacers;
     sequential_config.threshold = 2;
     sequential_config.prefer_gpu = false;
-    sequential_config.pam_filter = PamFilter::NONE;
     sequential_config.num_threads = 1;  // Force sequential
 
     BatchSearchConfig parallel_config = sequential_config;
@@ -508,7 +505,6 @@ TEST_CASE("search_genome_batch - single spacer uses sequential path",
     config.spacers = {{"single", "ACGTACGT"}};
     config.threshold = 2;
     config.prefer_gpu = false;
-    config.pam_filter = PamFilter::NONE;
     config.num_threads = 8;  // Request many threads, should still work
 
     auto result = search_genome_batch(config, genome);
@@ -530,7 +526,6 @@ TEST_CASE("search_genome_batch - result ordering preserved",
     config.spacers = spacers;
     config.threshold = 2;
     config.prefer_gpu = false;
-    config.pam_filter = PamFilter::NONE;
     config.num_threads = 8;
 
     auto result = search_genome_batch(config, genome);
@@ -554,7 +549,6 @@ TEST_CASE("search_genome_batch - num_threads=0 uses hardware concurrency",
     config.spacers = spacers;
     config.threshold = 2;
     config.prefer_gpu = false;
-    config.pam_filter = PamFilter::NONE;
     config.num_threads = 0;  // Auto
 
     // Should not throw, should complete successfully
@@ -692,7 +686,6 @@ TEST_CASE("search_genome - dedup reduces halo inflation on synthetic genome",
     config.threshold = 2;
     config.prefer_gpu = false;
     config.search_both_strands = false;  // Plus strand only for simplicity
-    config.pam_filter = PamFilter::NONE;
     config.compute_mismatches = false;
 
     SearchResult result = search_genome(config, genome);
@@ -736,13 +729,13 @@ TEST_CASE("normalize_uracil - search equivalence", "[search_pipeline][uracil]") 
     SearchConfig config_t;
     config_t.pattern = "ACGTACGTAC";
     config_t.threshold = 2;
-    config_t.pam_filter = PamFilter::NONE;
+    
     auto result_t = search_genome(config_t, genome);
 
     SearchConfig config_u;
     config_u.pattern = normalize_uracil("ACGUACGUAC");
     config_u.threshold = 2;
-    config_u.pam_filter = PamFilter::NONE;
+    
     auto result_u = search_genome(config_u, genome);
 
     REQUIRE(result_t.hits.size() == result_u.hits.size());
@@ -763,7 +756,7 @@ TEST_CASE("forward_only - skips RC search", "[search_pipeline][forward_only]") {
     SearchConfig config_both;
     config_both.pattern = "ACGTACGTAC";
     config_both.threshold = 2;
-    config_both.pam_filter = PamFilter::NONE;
+    
     config_both.search_both_strands = true;
     auto result_both = search_genome(config_both, genome);
 
@@ -771,7 +764,7 @@ TEST_CASE("forward_only - skips RC search", "[search_pipeline][forward_only]") {
     SearchConfig config_fwd;
     config_fwd.pattern = "ACGTACGTAC";
     config_fwd.threshold = 2;
-    config_fwd.pam_filter = PamFilter::NONE;
+    
     config_fwd.forward_only = true;
     auto result_fwd = search_genome(config_fwd, genome);
 
@@ -794,7 +787,6 @@ TEST_CASE("forward_only - RC-only hits return zero", "[search_pipeline][forward_
     SearchConfig config;
     config.pattern = pattern;
     config.threshold = 2;
-    config.pam_filter = PamFilter::NONE;
     config.forward_only = true;
     auto result = search_genome(config, genome);
 
@@ -917,33 +909,45 @@ TEST_CASE("search_genome - Hamming mode uses shift-add algorithm", "[search_pipe
 }
 
 TEST_CASE("search_genome - Hamming vs Levenshtein with no indels gives same results", "[search_pipeline][distance_mode]") {
-    // When there are no indels, Hamming and Levenshtein should give identical results
-    std::string seq = "ACGTACGTACGTACGT";
+    // When there are no indels, Hamming and Levenshtein must find the same sites.
+    // Use a non-palindromic pattern (AACC, RC=GGTT) so the two strands produce
+    // distinct hits and the test is unambiguous.
+    std::string seq = "NNNNAACCNNNNGGTTNNNN";
     auto genome = encode_genome({{"chr1", seq}});
-    
+
     SearchConfig config_lev;
-    config_lev.pattern = "ACGT";
+    config_lev.pattern = "AACC";
     config_lev.threshold = 0;
     config_lev.distance_mode = DistanceMode::LEVENSHTEIN;
     config_lev.prefer_gpu = false;
-    
+
     SearchConfig config_ham;
-    config_ham.pattern = "ACGT";
+    config_ham.pattern = "AACC";
     config_ham.threshold = 0;
     config_ham.distance_mode = DistanceMode::HAMMING;
     config_ham.prefer_gpu = false;
-    
+
     auto result_lev = search_genome(config_lev, genome);
     auto result_ham = search_genome(config_ham, genome);
-    
-    // Should have same number of hits
-    REQUIRE(result_lev.hits.size() == result_ham.hits.size());
-    
-    // Hits should be at same positions with same distances
-    for (size_t i = 0; i < result_lev.hits.size(); ++i) {
-        REQUIRE(result_lev.hits[i].genome_pos == result_ham.hits[i].genome_pos);
-        REQUIRE(result_lev.hits[i].distance == result_ham.hits[i].distance);
-    }
+
+    // Build position-sets for order-independent comparison
+    using PosStrand = std::pair<size_t, Strand>;
+    auto to_set = [](const std::vector<SearchHit>& hits) {
+        std::set<PosStrand> s;
+        for (const auto& h : hits) s.insert({h.genome_pos, h.strand});
+        return s;
+    };
+
+    auto lev_set = to_set(result_lev.hits);
+    auto ham_set = to_set(result_ham.hits);
+
+    // Both modes must find the same positions (set equality, not count equality,
+    // to tolerate any dedup differences at edge positions).
+    REQUIRE(lev_set == ham_set);
+
+    // All hits must be exact matches (distance 0)
+    for (const auto& h : result_lev.hits) REQUIRE(h.distance == 0);
+    for (const auto& h : result_ham.hits) REQUIRE(h.distance == 0);
 }
 
 TEST_CASE("search_genome - Hamming mode with substitutions", "[search_pipeline][distance_mode]") {

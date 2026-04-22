@@ -35,15 +35,6 @@ namespace cfd {
 // 20 have no published penalty table, so we truncate silently.
 inline constexpr size_t CFD_MAX_SPACER_LENGTH = 20;
 
-// Risk tier cutoffs (fraction of on-target activity).
-inline constexpr double CFD_HIGH_RISK_THRESHOLD   = 0.1;   // >=10% activity
-inline constexpr double CFD_MEDIUM_RISK_THRESHOLD = 0.01;  // >=1% activity
-
-// MIT specificity tier cutoffs (100 / (100 + ΣCFD)).
-inline constexpr double MIT_EXCELLENT_THRESHOLD = 80.0;
-inline constexpr double MIT_GOOD_THRESHOLD      = 50.0;
-inline constexpr double MIT_FAIR_THRESHOLD      = 20.0;
-
 // Core scoring functions
 
 // Get the CFD penalty for a single mismatch at a specific position.
@@ -125,65 +116,5 @@ double compute_cfd_score(const std::string& pattern,
 double compute_cfd_score(const std::string& pattern,
                          const MismatchInfo& mismatch_info);
 
-// Utility functions
-
-// Classify a CFD score into a risk tier.
-//
-// Returns:
-//   0 = Low risk (CFD < 0.01) - very unlikely to cause off-target cleavage
-//   1 = Medium risk (0.01 <= CFD < 0.1)
-//   2 = High risk (CFD >= 0.1) - significant off-target potential
-uint8_t classify_risk_tier(double cfd_score);
-
-// Check if a CFD score exceeds the "active" threshold
-// (default: CFD_HIGH_RISK_THRESHOLD = 10% of on-target activity).
-bool is_predicted_active(double cfd_score, double threshold = CFD_HIGH_RISK_THRESHOLD);
-
-// MIT Specificity Score
-//
-// The MIT Specificity Score is an aggregate metric that predicts guide RNA
-// specificity by considering all potential off-targets in the genome.
-// Developed by the Hsu/Zhang lab at MIT, it's used in their CRISPR design tool.
-//
-// The formula is:
-//   Specificity = 100 / (100 + Σ(CFD_i))
-//
-// Where CFD_i is the CFD score of each off-target site (excluding on-target).
-//
-// Specificity scores range from 0 to 100:
-//   - 100 = perfect specificity (no predicted off-targets)
-//   - >50 = generally acceptable guide
-//   - <50 = high off-target burden, consider alternative guide
-//   - 0 = approaches as off-target burden increases
-//
-// References:
-//   - Hsu et al. (2013) Nature Biotechnology 31:827-832
-//   - MIT CRISPR Design Tool: http://crispr.mit.edu
-// ───────────────────────────────────────────────────────────────────────────
-
-// Compute MIT Specificity Score from a collection of CFD scores.
-//
-// Parameters:
-//   cfd_scores - Vector of CFD scores for all off-target hits
-//   include_perfect_matches - Whether to include CFD=1.0 scores in the sum
-//                             (typically false, as perfect matches are
-//                             excluded from specificity calculation)
-//
-// Returns:
-//   Specificity score between 0.0 and 100.0
-//   - 100.0 = no off-targets (or empty input)
-//   - Lower scores indicate higher off-target burden
-double compute_mit_specificity_score(
-    const std::vector<double>& cfd_scores,
-    bool include_perfect_matches = false);
-
-// Classify a MIT specificity score into quality tiers.
-//
-// Returns:
-//   0 = Poor specificity (score < 20) - high off-target burden
-//   1 = Fair specificity (20 <= score < 50) - moderate off-target burden
-//   2 = Good specificity (50 <= score < 80) - acceptable for most uses
-//   3 = Excellent specificity (score >= 80) - very few predicted off-targets
-uint8_t classify_specificity_tier(double mit_score);
 
 } // namespace cfd

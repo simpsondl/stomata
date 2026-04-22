@@ -35,14 +35,12 @@ constexpr size_t PARALLEL_HITS_MIN_COUNT = 100;
 // Need at least this many hits per worker thread for parallelism to pay off.
 constexpr size_t PARALLEL_MIN_CHUNK_SIZE = 50;
 
-// CRISPR seed region: the PAM-proximal 8 nt (positions m-8..m-1 in pattern
-// coordinates). Edits here disrupt Cas9 activity more than distal edits.
-constexpr size_t SEED_REGION_LENGTH = 8;
-
-// SpCas9 PAM length (NGG / NAG).
-constexpr size_t SPCAS9_PAM_LENGTH = 3;
-
 }  // namespace
+
+bool cigar_has_indel(const std::string& cigar) {
+    return cigar.find('I') != std::string::npos ||
+           cigar.find('D') != std::string::npos;
+}
 
 // Filtering
 
@@ -63,7 +61,7 @@ std::vector<size_t> filter_by_threshold(const std::vector<uint8_t>& distances,
 // Hit deduplication
 
 std::vector<SearchHit> deduplicate_hits(std::vector<SearchHit> hits,
-                                         size_t pattern_len) {
+                                         size_t dedup_radius) {
     if (hits.size() <= 1) return hits;
 
     // Sort by strand first, then genome position
@@ -83,13 +81,12 @@ std::vector<SearchHit> deduplicate_hits(std::vector<SearchHit> hits,
         size_t cluster_end = i + 1;
 
         // Extend cluster: consecutive hits on same strand AND same chromosome
-        // that are within (pattern_len - 1) positions of each other.
-        // This gap ensures overlapping alignments (halos) are merged, but
-        // non-overlapping matches (even if pattern_len apart) are kept separate.
+        // within dedup_radius positions of each other.
+        // For Levenshtein, dedup_radius = threshold+1 (exact Myers halo size).
         while (cluster_end < hits.size() &&
                hits[cluster_end].strand == hits[i].strand &&
                hits[cluster_end].chrom_name == hits[cluster_end - 1].chrom_name &&
-               hits[cluster_end].genome_pos - hits[cluster_end - 1].genome_pos < pattern_len) {
+               hits[cluster_end].genome_pos - hits[cluster_end - 1].genome_pos < dedup_radius) {
 
             // Track the best hit in cluster using PAM-aware selection:
             // 1. Prefer lower distance
@@ -188,52 +185,59 @@ static void validate_pattern(const std::string& pattern) {
     }
 }
 
-// PAM validation
+// PAM matching (IUPAC)
 
-// Check if a 3-base PAM sequence is valid (NGG or NAG).
-// Returns true for valid PAMs, false otherwise.
-// Classify a PAM sequence into its type (NGG, NAG, OTHER, or INCOMPLETE).
-static PamType classify_pam(const std::string& pam) {
-    if (pam.size() < 3) {
-        return PamType::INCOMPLETE;
+// Match one IUPAC pattern base against one observed base.
+// Pattern '-' is rejected. Observed 'N' is treated as unknown and does not
+// match any concrete pattern base (mirrors search_pipeline's masking semantics).
+static bool iupac_match_one(char pat, char seq) {
+    pat = static_cast<char>(std::toupper(static_cast<unsigned char>(pat)));
+    seq = static_cast<char>(std::toupper(static_cast<unsigned char>(seq)));
+    if (seq == 'N') return pat == 'N';
+    switch (pat) {
+        case 'A': return seq == 'A';
+        case 'C': return seq == 'C';
+        case 'G': return seq == 'G';
+        case 'T': case 'U': return seq == 'T';
+        case 'R': return seq == 'A' || seq == 'G';
+        case 'Y': return seq == 'C' || seq == 'T';
+        case 'S': return seq == 'C' || seq == 'G';
+        case 'W': return seq == 'A' || seq == 'T';
+        case 'K': return seq == 'G' || seq == 'T';
+        case 'M': return seq == 'A' || seq == 'C';
+        case 'B': return seq != 'A';
+        case 'D': return seq != 'C';
+        case 'H': return seq != 'G';
+        case 'V': return seq != 'T';
+        case 'N': return true;
+        default:  return false;
     }
-
-    // N at first position is always valid
-    // Second position must be G (for NGG) or A (for NAG)
-    // Third position must be G
-    char p2 = static_cast<char>(std::toupper(static_cast<unsigned char>(pam[1])));
-    char p3 = static_cast<char>(std::toupper(static_cast<unsigned char>(pam[2])));
-
-    // NGG: second and third are G
-    if (p2 == 'G' && p3 == 'G') {
-        return PamType::NGG;
-    }
-
-    // NAG: second is A, third is G
-    if (p2 == 'A' && p3 == 'G') {
-        return PamType::NAG;
-    }
-
-    return PamType::OTHER;
 }
 
-// Check if a PAM type matches the specified filter.
-// Returns true if the PAM should be included based on the filter.
-static bool matches_pam_filter(PamType pam_type, PamFilter filter) {
-    if (filter == PamFilter::NONE || filter == PamFilter::ANY) {
-        return true;  // No filtering
+// Match an observed PAM (genomic bases) against an IUPAC pattern.
+// Returns false when the observation is shorter than the pattern; any
+// extraction overhang beyond the pattern length is ignored (so users can
+// request wider PAM context than they filter on).
+static bool pam_matches_pattern(const std::string& pam, const std::string& pattern) {
+    if (pam.size() < pattern.size()) return false;
+    for (size_t i = 0; i < pattern.size(); ++i) {
+        if (!iupac_match_one(pattern[i], pam[i])) return false;
     }
+    return true;
+}
 
-    switch (filter) {
-        case PamFilter::NGG_ONLY:
-            return pam_type == PamType::NGG;
-        case PamFilter::NAG_ONLY:
-            return pam_type == PamType::NAG;
-        case PamFilter::NGG_OR_NAG:
-            return pam_type == PamType::NGG || pam_type == PamType::NAG;
-        default:
-            return true;
-    }
+// Internal SpCas9 classifier retained for the halo dedup tie-breaker. Applied
+// only for 3' PAMs; 5' PAM spacers receive OTHER so the dedup bias stays out of
+// tech configurations it wasn't designed for. Slated for removal when the halo
+// dedup heuristic is revisited.
+static PamType classify_pam_for_dedup(const std::string& pam, PamPosition position) {
+    if (position != PamPosition::THREE_PRIME) return PamType::OTHER;
+    if (pam.size() < 3) return PamType::INCOMPLETE;
+    char p2 = static_cast<char>(std::toupper(static_cast<unsigned char>(pam[1])));
+    char p3 = static_cast<char>(std::toupper(static_cast<unsigned char>(pam[2])));
+    if (p2 == 'G' && p3 == 'G') return PamType::NGG;
+    if (p2 == 'A' && p3 == 'G') return PamType::NAG;
+    return PamType::OTHER;
 }
 
 // Parallel annotation helper: work-stealing over hits for post-search enrichment.
@@ -286,40 +290,62 @@ static void parallel_process_hits(std::vector<SearchHit>& hits,
     }
 }
 
-// Lightweight PAM-only extraction (runs before full annotation so PAM filters
-// can reject hits before the expensive alignment work).
+// Extract the PAM bases adjacent to a hit, given a pluggable PamSpec.
+// Works for both 3'-PAM technologies (Cas9: spacer-PAM) and 5'-PAM technologies
+// (Cas12a: PAM-spacer), and for arbitrary PAM length. On the minus strand the
+// returned sequence is already reverse-complemented to live in the hit's own
+// orientation.
+//
+// The plus-strand alignment spans [align_begin, genome_pos]. On the minus
+// strand the RC'd alignment spans that same window on the forward strand; the
+// "3'-PAM" in the hit's orientation therefore sits *before* align_begin on the
+// forward strand (RC'd to restore orientation), and the "5'-PAM" sits *after*
+// the end of the window. Plus strand is the mirror of that.
+static void extract_pam_bases(const GenomeView& view, SearchHit& hit,
+                              size_t pattern_len, const PamSpec& pam_spec) {
+    const size_t L = pam_spec.effective_extract_length();
+    if (L == 0) {
+        hit.mismatch_info.pam_sequence.clear();
+        return;
+    }
 
-// Extract only the PAM sequence and classify it, without doing full alignment.
-// This is the cheap part of extract_mismatch_info() - just genome slicing + classification.
-// Used for early PAM filtering to avoid expensive annotation for hits that will be filtered out.
-static void extract_pam_only(const GenomeView& view, SearchHit& hit, size_t pattern_len) {
-    // For SpCas9, PAM (NGG) is 3' of the protospacer
-    if (hit.strand == Strand::PLUS) {
-        size_t pam_start = hit.genome_pos + 1;
-        if (pam_start + SPCAS9_PAM_LENGTH <= view.total_bases) {
-            hit.mismatch_info.pam_sequence = extract_genome_slice(view, pam_start, SPCAS9_PAM_LENGTH);
-        } else if (pam_start < view.total_bases) {
-            hit.mismatch_info.pam_sequence = extract_genome_slice(view, pam_start,
-                                                                   view.total_bases - pam_start);
+    const size_t end_pos = hit.genome_pos;  // Myers end position (last text char of the window)
+    const size_t align_begin = (end_pos >= pattern_len - 1) ? end_pos - pattern_len + 1 : 0;
+
+    const bool three_prime_in_hit_orientation = (pam_spec.position == PamPosition::THREE_PRIME);
+    const bool plus = (hit.strand == Strand::PLUS);
+
+    // Forward-strand side where the PAM bytes live:
+    //   plus + 3'-PAM  -> after the window
+    //   plus + 5'-PAM  -> before the window
+    //   minus + 3'-PAM -> before the window (then RC)
+    //   minus + 5'-PAM -> after the window (then RC)
+    const bool pam_after_window = (plus && three_prime_in_hit_orientation) ||
+                                  (!plus && !three_prime_in_hit_orientation);
+
+    std::string bases;
+    if (pam_after_window) {
+        size_t pam_start = end_pos + 1;
+        if (pam_start >= view.total_bases) {
+            bases.clear();
         } else {
-            hit.mismatch_info.pam_sequence = "";
+            size_t avail = view.total_bases - pam_start;
+            size_t take  = std::min(avail, L);
+            bases = extract_genome_slice(view, pam_start, take);
         }
     } else {
-        // Minus strand: PAM is 5' of the RC alignment on the forward strand
-        size_t align_begin = (hit.genome_pos >= pattern_len - 1) ? hit.genome_pos - pattern_len + 1 : 0;
-        if (align_begin >= SPCAS9_PAM_LENGTH) {
-            size_t pam_start = align_begin - SPCAS9_PAM_LENGTH;
-            hit.mismatch_info.pam_sequence = reverse_complement(
-                extract_genome_slice(view, pam_start, SPCAS9_PAM_LENGTH));
-        } else if (align_begin > 0) {
-            hit.mismatch_info.pam_sequence = reverse_complement(
-                extract_genome_slice(view, 0, align_begin));
+        if (align_begin == 0) {
+            bases.clear();
         } else {
-            hit.mismatch_info.pam_sequence = "";
+            size_t take = std::min(align_begin, L);
+            bases = extract_genome_slice(view, align_begin - take, take);
         }
     }
 
-    hit.mismatch_info.pam_type = classify_pam(hit.mismatch_info.pam_sequence);
+    if (!plus) bases = reverse_complement(bases);
+    hit.mismatch_info.pam_sequence = std::move(bases);
+    hit.mismatch_info.pam_type =
+        classify_pam_for_dedup(hit.mismatch_info.pam_sequence, pam_spec.position);
 }
 
 // Alignment computation
@@ -523,42 +549,6 @@ static std::string format_cigar(const std::vector<AlignOp>& alignment) {
     return out;
 }
 
-// Mismatch extraction
-
-// Extract detailed mismatch information for a hit.
-// For minus strand hits, the aligned_sequence is stored in forward orientation
-// but comparison and mismatch positions are computed in the pattern's orientation.
-// Extract the 3' SpCas9 PAM (3 nt, NGG) adjacent to the protospacer.
-//   Plus strand:  5'-[spacer]-PAM-3'   → PAM at genome_pos + 1
-//   Minus strand: PAM is 5' of the RC alignment on the forward strand; extract
-//                 from the forward strand and RC to get the PAM on the minus strand.
-// Writes hit.mismatch_info.pam_sequence and pam_type.
-static void extract_pam_sequence(GenomeView view, SearchHit& hit, size_t m) {
-    if (hit.strand == Strand::PLUS) {
-        size_t pam_start = hit.genome_pos + 1;
-        if (pam_start + SPCAS9_PAM_LENGTH <= view.total_bases) {
-            hit.mismatch_info.pam_sequence = extract_genome_slice(view, pam_start, SPCAS9_PAM_LENGTH);
-        } else if (pam_start < view.total_bases) {
-            hit.mismatch_info.pam_sequence = extract_genome_slice(view, pam_start,
-                                                                   view.total_bases - pam_start);
-        } else {
-            hit.mismatch_info.pam_sequence = "";
-        }
-    } else {
-        size_t align_begin = (hit.genome_pos >= m - 1) ? hit.genome_pos - m + 1 : 0;
-        if (align_begin >= SPCAS9_PAM_LENGTH) {
-            hit.mismatch_info.pam_sequence = reverse_complement(
-                extract_genome_slice(view, align_begin - SPCAS9_PAM_LENGTH, SPCAS9_PAM_LENGTH));
-        } else if (align_begin > 0) {
-            hit.mismatch_info.pam_sequence = reverse_complement(
-                extract_genome_slice(view, 0, align_begin));
-        } else {
-            hit.mismatch_info.pam_sequence = "";
-        }
-    }
-    hit.mismatch_info.pam_type = classify_pam(hit.mismatch_info.pam_sequence);
-}
-
 // Distance-zero case: the aligned m-base window has no gaps, so we take the
 // last (PLUS) or first (MINUS, RC'd) m bases of the extracted compare_sequence.
 static std::string extract_aligned_region_perfect_match(const std::string& compare_sequence,
@@ -588,87 +578,13 @@ static std::string build_aligned_sequence_from_alignment(const std::vector<Align
     return out;
 }
 
-// Split edits into PAM-proximal seed vs distal (positions 1..m-SEED_REGION_LENGTH).
-// Pattern 'N' is a wildcard (no mismatch recorded); genome 'N' is masked (always
-// a mismatch). Positions reported are 1-based in pattern coordinates.
-static void classify_edits_by_region(const std::vector<AlignOp>& alignment,
-                                     const std::string& pattern,
-                                     const std::string& text,
-                                     size_t align_text_start,
-                                     size_t m,
-                                     MismatchInfo& out) {
-    const size_t distal_end = (m > SEED_REGION_LENGTH) ? m - SEED_REGION_LENGTH : 0;
-    size_t pattern_pos = 0;
-    size_t text_pos = align_text_start;
-
-    auto record_edit = [&](EditType type) {
-        out.mismatch_positions.push_back(static_cast<uint8_t>(pattern_pos + 1));
-        out.edit_types.push_back(type);
-        const bool distal = pattern_pos < distal_end;
-        const bool in_seed = !distal && pattern_pos < m;
-        switch (type) {
-            case EditType::MISMATCH:
-                if (distal)       ++out.distal_mismatches;
-                else if (in_seed) ++out.seed_mismatches;
-                break;
-            case EditType::DNA_BULGE:
-                if (distal)       ++out.distal_dna_bulges;
-                else if (in_seed) ++out.seed_dna_bulges;
-                break;
-            case EditType::RNA_BULGE:
-                if (distal)       ++out.distal_rna_bulges;
-                else if (in_seed) ++out.seed_rna_bulges;
-                break;
-            case EditType::NONE:
-                break;
-        }
-    };
-
-    for (const AlignOp& op : alignment) {
-        switch (op) {
-            case AlignOp::MATCH: {
-                if (pattern_pos < pattern.size() && text_pos < text.size()) {
-                    char p = static_cast<char>(std::toupper(static_cast<unsigned char>(pattern[pattern_pos])));
-                    char t = static_cast<char>(std::toupper(static_cast<unsigned char>(text[text_pos])));
-                    if (p != 'N' && (t == 'N' || p != t)) {
-                        record_edit(EditType::MISMATCH);
-                    }
-                }
-                ++pattern_pos;
-                ++text_pos;
-                break;
-            }
-            case AlignOp::INS_TEXT:
-                record_edit(EditType::DNA_BULGE);
-                ++text_pos;
-                break;
-            case AlignOp::INS_PATTERN:
-                record_edit(EditType::RNA_BULGE);
-                ++pattern_pos;
-                break;
-        }
-    }
-}
-
 static void extract_mismatch_info(const std::string& original_pattern,
                                   GenomeView view,
+                                  const PamSpec& pam_spec,
                                   SearchHit& hit) {
     const size_t m = original_pattern.size();
-
-    // Reset per-hit mutable fields (pam_sequence may already be set by the
-    // early lazy-PAM path — preserved across the clear).
-    hit.mismatch_info.mismatch_positions.clear();
-    hit.mismatch_info.edit_types.clear();
-    hit.mismatch_info.seed_mismatches = 0;
-    hit.mismatch_info.seed_dna_bulges = 0;
-    hit.mismatch_info.seed_rna_bulges = 0;
-    hit.mismatch_info.distal_mismatches = 0;
-    hit.mismatch_info.distal_dna_bulges = 0;
-    hit.mismatch_info.distal_rna_bulges = 0;
     hit.mismatch_info.alignment_is_ambiguous = false;
 
-    // Extract a window big enough to hold the alignment (up to m + distance bases
-    // before the Myers end-position, to account for pattern-side insertions).
     const size_t max_align_len = m + hit.distance + 1;
     const size_t align_start = (hit.genome_pos >= max_align_len - 1)
                                ? hit.genome_pos - max_align_len + 1 : 0;
@@ -676,11 +592,9 @@ static void extract_mismatch_info(const std::string& original_pattern,
     const std::string genome_seq = extract_genome_slice(view, align_start, align_len);
 
     if (hit.mismatch_info.pam_sequence.empty()) {
-        extract_pam_sequence(view, hit, m);
+        extract_pam_bases(view, hit, m, pam_spec);
     }
 
-    // For the MINUS strand we searched with the RC pattern, so RC the window
-    // before comparison. The PAM was already RC'd by extract_pam_sequence.
     const std::string& compare_pattern = original_pattern;
     std::string compare_sequence = (hit.strand == Strand::MINUS)
         ? reverse_complement(genome_seq) : genome_seq;
@@ -692,8 +606,6 @@ static void extract_mismatch_info(const std::string& original_pattern,
         return;
     }
 
-    // distance > 0: run banded alignment. Plus strand anchors at j=n (Myers end),
-    // minus strand (RC'd window) anchors at leftmost min of last row.
     const bool anchor_right = (hit.strand == Strand::PLUS);
     AlignmentResult ar = compute_alignment(compare_pattern, compare_sequence, anchor_right);
     hit.mismatch_info.alignment_is_ambiguous = ar.has_ambiguity;
@@ -709,9 +621,6 @@ static void extract_mismatch_info(const std::string& original_pattern,
 
     hit.mismatch_info.aligned_sequence = build_aligned_sequence_from_alignment(
         ar.alignment, compare_sequence, align_text_start);
-
-    classify_edits_by_region(ar.alignment, compare_pattern, compare_sequence,
-                             align_text_start, m, hit.mismatch_info);
 }
 
 // Search pipeline
@@ -799,11 +708,17 @@ SearchResult search_genome(const SearchConfig& config, GenomeView view) {
         // Filter by threshold (returned indices are relative to search_start)
         auto hit_positions = filter_by_threshold(distances, config.threshold);
 
-        // Build SearchHit objects with chromosome info
+        // Build SearchHit objects with chromosome info.
+        // For Hamming (bitap), positions rel_pos < pattern_len-1 are prefix-match
+        // artifacts from the start of the text, not full-length alignments — skip them.
+        const size_t min_valid_pos = (config.distance_mode == DistanceMode::HAMMING)
+                                     ? fwd_pattern.size() - 1
+                                     : 0;
         std::vector<SearchHit> hits;
         hits.reserve(hit_positions.size());
 
         for (size_t rel_pos : hit_positions) {
+            if (rel_pos < min_valid_pos) continue;
             size_t abs_pos = search_start + rel_pos;
             hits.push_back(make_search_hit(view, abs_pos, distances[rel_pos], strand));
         }
@@ -838,66 +753,62 @@ SearchResult search_genome(const SearchConfig& config, GenomeView view) {
 
     // Lazy PAM extraction: extract PAM first (cheap), filter, then run the
     // full alignment annotation only for hits that pass the PAM filter.
-    bool enable_lazy_pam = (config.pam_filter != PamFilter::NONE &&
-                           config.pam_filter != PamFilter::ANY &&
-                           config.compute_mismatches);
+    const bool enable_lazy_pam = config.pam.filtering_enabled() && config.compute_mismatches;
 
     if (enable_lazy_pam) {
-        // Step 1: Extract PAM only for all hits (cheap - just genome slicing) - PARALLEL
         parallel_process_hits(result.hits,
             [&](SearchHit& hit) {
-                extract_pam_only(view, hit, config.pattern.size());
+                extract_pam_bases(view, hit, config.pattern.size(), config.pam);
             },
             num_threads);
 
-        // Step 2: Filter by PAM early (discards ~93% of hits for NGG filter)
         std::vector<SearchHit> filtered_hits;
-        filtered_hits.reserve(result.hits.size() / 10);  // Expect ~10% to pass
+        filtered_hits.reserve(result.hits.size() / 10);
 
         for (auto& hit : result.hits) {
-            if (matches_pam_filter(hit.mismatch_info.pam_type, config.pam_filter)) {
+            if (pam_matches_pattern(hit.mismatch_info.pam_sequence, config.pam.pattern)) {
                 filtered_hits.push_back(std::move(hit));
             }
         }
 
         result.hits = std::move(filtered_hits);
 
-        // Step 3: Extract full mismatch info only for passing hits (expensive but only 6-7% of original set) - PARALLEL
         parallel_process_hits(result.hits,
             [&](SearchHit& hit) {
-                extract_mismatch_info(config.pattern, view, hit);
+                extract_mismatch_info(config.pattern, view, config.pam, hit);
             },
             num_threads);
     } else {
-        // Original path: Extract full mismatch info for all hits - PARALLEL
         if (config.compute_mismatches) {
             parallel_process_hits(result.hits,
                 [&](SearchHit& hit) {
-                    extract_mismatch_info(config.pattern, view, hit);
+                    extract_mismatch_info(config.pattern, view, config.pam, hit);
                 },
                 num_threads);
         }
     }
 
-    // Deduplicate overlapping semi-global alignment hits.
-    // Myers' algorithm reports edit distance at every position, creating
-    // "halos" of nearby low-distance positions around each real match.
-    // Deduplication is PAM-aware: when clustering hits with equal distance,
-    // it prefers hits with valid PAMs (NGG > NAG > OTHER).
-    if (!config.disable_deduplication) {
-        result.hits = deduplicate_hits(std::move(result.hits), config.pattern.size());
+    // Deduplicate overlapping alignment hits (Levenshtein only).
+    // Hamming mode has no halo — each position is independent; skip dedup.
+    // Levenshtein: Myers halo radius = threshold positions from the true match
+    // end; use threshold+1 to safely collapse halos without dropping nearby
+    // genuine distinct sites.
+    if (!config.disable_deduplication && config.distance_mode == DistanceMode::LEVENSHTEIN) {
+        result.hits = deduplicate_hits(std::move(result.hits),
+                                       static_cast<size_t>(config.threshold) + 1);
     }
 
     // Compute CFD scores if requested (requires mismatch info) - PARALLEL
     if (config.compute_scores && config.compute_mismatches) {
+        auto score_t0 = std::chrono::high_resolution_clock::now();
         parallel_process_hits(result.hits,
             [&](SearchHit& hit) {
                 hit.scoring_info.cfd_score = cfd::compute_cfd_score(
                     config.pattern, hit.mismatch_info);
-                hit.scoring_info.risk_tier = cfd::classify_risk_tier(
-                    hit.scoring_info.cfd_score);
             },
             num_threads);
+        result.scoring_time_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now() - score_t0).count();
     }
 
     // PAM filtering already done above in lazy path
@@ -912,89 +823,21 @@ SearchResult search_genome(const SearchConfig& config, GenomeView view) {
 
 // Output formatting
 
-static const char* pam_type_str(PamType t) {
-    switch (t) {
-        case PamType::NGG:        return "NGG";
-        case PamType::NAG:        return "NAG";
-        case PamType::OTHER:      return "OTHER";
-        case PamType::INCOMPLETE: return "INCOMPLETE";
-    }
-    return "OTHER";
-}
-
-static const char* edit_type_str(EditType t) {
-    switch (t) {
-        case EditType::NONE:      return "NONE";
-        case EditType::MISMATCH:  return "MISMATCH";
-        case EditType::DNA_BULGE: return "DNA_BULGE";
-        case EditType::RNA_BULGE: return "RNA_BULGE";
-    }
-    return "NONE";
-}
-
-static const char* risk_tier_str(uint8_t tier) {
-    switch (tier) {
-        case 0: return "LOW";
-        case 1: return "MEDIUM";
-        case 2: return "HIGH";
-    }
-    return "UNKNOWN";
-}
-
-static const char* specificity_tier_str(uint8_t tier) {
-    switch (tier) {
-        case 0: return "POOR";
-        case 1: return "FAIR";
-        case 2: return "GOOD";
-        case 3: return "EXCELLENT";
-    }
-    return "UNKNOWN";
-}
-
-static std::string format_mismatch_positions(const std::vector<uint8_t>& positions) {
-    if (positions.empty()) return ".";
-    std::string out;
-    for (size_t i = 0; i < positions.size(); ++i) {
-        if (i > 0) out += ",";
-        out += std::to_string(positions[i]);
-    }
-    return out;
-}
-
-static std::string format_edit_types(const std::vector<EditType>& edits) {
-    if (edits.empty()) return ".";
-    std::string out;
-    for (size_t i = 0; i < edits.size(); ++i) {
-        if (i > 0) out += ",";
-        out += edit_type_str(edits[i]);
-    }
-    return out;
-}
-
 std::string format_hits_tsv(const std::vector<SearchHit>& hits,
                             const std::string& pattern) {
     std::ostringstream oss;
 
-    // Header with new biologically-meaningful columns
     oss << "chrom\tstart\tend\tpattern\tdistance\tstrand\t"
-        << "aligned_seq\tmismatch_pos\tedit_types\tcigar\t"
-        << "pam_seq\tpam_type\t"
-        << "seed_edits\tdistal_edits\t"
-        << "seed_mismatches\tseed_dna_bulges\tseed_rna_bulges\t"
-        << "distal_mismatches\tdistal_dna_bulges\tdistal_rna_bulges\t"
+        << "aligned_seq\tcigar\tpam_seq\t"
         << "alignment_ambiguous\tn_ambiguous_cells\t"
-        << "cfd_score\trisk_tier\n";
+        << "cfd_score\n";
 
-    // Data rows
     size_t pattern_len = pattern.size();
     for (const auto& hit : hits) {
-        // Start position is where the alignment ends minus pattern length + 1
-        // For semi-global alignment ending at hit.chrom_offset:
-        // start = chrom_offset - pattern_len + 1 (but can't be negative)
         size_t start = (hit.chrom_offset >= pattern_len - 1)
                        ? hit.chrom_offset - pattern_len + 1
                        : 0;
-        size_t end = hit.chrom_offset + 1;  // exclusive end
+        size_t end = hit.chrom_offset + 1;
 
         oss << hit.chrom_name << '\t'
             << start << '\t'
@@ -1003,23 +846,11 @@ std::string format_hits_tsv(const std::vector<SearchHit>& hits,
             << static_cast<int>(hit.distance) << '\t'
             << static_cast<char>(hit.strand) << '\t'
             << (hit.mismatch_info.aligned_sequence.empty() ? "." : hit.mismatch_info.aligned_sequence) << '\t'
-            << format_mismatch_positions(hit.mismatch_info.mismatch_positions) << '\t'
-            << format_edit_types(hit.mismatch_info.edit_types) << '\t'
             << (hit.mismatch_info.cigar.empty() ? "." : hit.mismatch_info.cigar) << '\t'
             << (hit.mismatch_info.pam_sequence.empty() ? "." : hit.mismatch_info.pam_sequence) << '\t'
-            << pam_type_str(hit.mismatch_info.pam_type) << '\t'
-            << static_cast<int>(hit.mismatch_info.total_seed_edits()) << '\t'
-            << static_cast<int>(hit.mismatch_info.total_distal_edits()) << '\t'
-            << static_cast<int>(hit.mismatch_info.seed_mismatches) << '\t'
-            << static_cast<int>(hit.mismatch_info.seed_dna_bulges) << '\t'
-            << static_cast<int>(hit.mismatch_info.seed_rna_bulges) << '\t'
-            << static_cast<int>(hit.mismatch_info.distal_mismatches) << '\t'
-            << static_cast<int>(hit.mismatch_info.distal_dna_bulges) << '\t'
-            << static_cast<int>(hit.mismatch_info.distal_rna_bulges) << '\t'
             << (hit.mismatch_info.alignment_is_ambiguous ? "true" : "false") << '\t'
             << static_cast<int>(hit.mismatch_info.n_ambiguous_cells) << '\t'
-            << hit.scoring_info.cfd_score << '\t'
-            << risk_tier_str(hit.scoring_info.risk_tier) << '\n';
+            << hit.scoring_info.cfd_score << '\n';
     }
 
     return oss.str();
@@ -1105,20 +936,6 @@ void write_hit_body_json(std::ostringstream& oss,
     else oss << "\"" << json_escape(mi.aligned_sequence) << "\"";
     oss << ",";
 
-    oss << "\"mismatch_pos\":[";
-    for (size_t i = 0; i < mi.mismatch_positions.size(); ++i) {
-        if (i) oss << ",";
-        oss << static_cast<int>(mi.mismatch_positions[i]);
-    }
-    oss << "],";
-
-    oss << "\"edit_types\":[";
-    for (size_t i = 0; i < mi.edit_types.size(); ++i) {
-        if (i) oss << ",";
-        oss << "\"" << edit_type_str(mi.edit_types[i]) << "\"";
-    }
-    oss << "],";
-
     oss << "\"cigar\":";
     if (mi.cigar.empty()) oss << "null";
     else oss << "\"" << json_escape(mi.cigar) << "\"";
@@ -1129,19 +946,9 @@ void write_hit_body_json(std::ostringstream& oss,
     else oss << "\"" << json_escape(mi.pam_sequence) << "\"";
     oss << ",";
 
-    oss << "\"pam_type\":\""           << pam_type_str(mi.pam_type) << "\","
-        << "\"seed_edits\":"           << static_cast<int>(mi.total_seed_edits()) << ","
-        << "\"distal_edits\":"         << static_cast<int>(mi.total_distal_edits()) << ","
-        << "\"seed_mismatches\":"      << static_cast<int>(mi.seed_mismatches) << ","
-        << "\"seed_dna_bulges\":"      << static_cast<int>(mi.seed_dna_bulges) << ","
-        << "\"seed_rna_bulges\":"      << static_cast<int>(mi.seed_rna_bulges) << ","
-        << "\"distal_mismatches\":"    << static_cast<int>(mi.distal_mismatches) << ","
-        << "\"distal_dna_bulges\":"    << static_cast<int>(mi.distal_dna_bulges) << ","
-        << "\"distal_rna_bulges\":"    << static_cast<int>(mi.distal_rna_bulges) << ","
-        << "\"alignment_ambiguous\":"  << (mi.alignment_is_ambiguous ? "true" : "false") << ","
+    oss << "\"alignment_ambiguous\":"  << (mi.alignment_is_ambiguous ? "true" : "false") << ","
         << "\"n_ambiguous_cells\":"    << static_cast<int>(mi.n_ambiguous_cells) << ","
-        << "\"cfd_score\":"            << hit.scoring_info.cfd_score << ","
-        << "\"risk_tier\":\""          << risk_tier_str(hit.scoring_info.risk_tier) << "\"";
+        << "\"cfd_score\":"            << hit.scoring_info.cfd_score;
 }
 
 }  // anonymous namespace
@@ -1229,28 +1036,6 @@ std::vector<SpacerEntry> parse_spacer_file(const std::string& filepath) {
 
 // Compute MIT specificity scores for all spacers in a batch result.
 // This aggregates CFD scores across all off-targets for each spacer.
-static void compute_batch_mit_scores(BatchSearchResult& batch_result) {
-    for (auto& spacer_result : batch_result.spacer_results) {
-        // Collect CFD scores from all hits for this spacer
-        std::vector<double> cfd_scores;
-        cfd_scores.reserve(spacer_result.result.hits.size());
-        
-        for (const auto& hit : spacer_result.result.hits) {
-            cfd_scores.push_back(hit.scoring_info.cfd_score);
-        }
-        
-        // Compute MIT specificity score
-        // Note: We don't exclude perfect matches here because in batch mode,
-        // we're typically looking at all off-targets, not including the on-target
-        spacer_result.mit_specificity_score = 
-            cfd::compute_mit_specificity_score(cfd_scores, false);
-        
-        // Classify specificity tier
-        spacer_result.specificity_tier = 
-            cfd::classify_specificity_tier(spacer_result.mit_specificity_score);
-    }
-}
-
 // Sequential batch search implementation (used for single spacer or num_threads=1)
 static BatchSearchResult search_genome_batch_sequential(
     const BatchSearchConfig& config, GenomeView view) {
@@ -1296,7 +1081,7 @@ static BatchSearchResult search_genome_batch_sequential(
         single_config.reverse_only = config.reverse_only;
         single_config.compute_mismatches = config.compute_mismatches;
         single_config.compute_scores = config.compute_scores;
-        single_config.pam_filter = config.pam_filter;
+        single_config.pam = config.pam;
         single_config.max_hits = config.max_hits_per_spacer;
         single_config.distance_mode = config.distance_mode;
         single_config.search_start = config.search_start;
@@ -1323,11 +1108,6 @@ static BatchSearchResult search_genome_batch_sequential(
     auto end_time = std::chrono::high_resolution_clock::now();
     batch_result.total_time_ms = std::chrono::duration<double, std::milli>(
         end_time - start_time).count();
-
-    // Compute MIT specificity scores if requested
-    if (config.compute_mit_score && config.compute_scores) {
-        compute_batch_mit_scores(batch_result);
-    }
 
     return batch_result;
 }
@@ -1450,63 +1230,59 @@ static BatchSearchResult search_genome_batch_gpu(
         }
 
         // Lazy PAM extraction with early filtering (see single-search path).
-        bool enable_lazy_pam = (config.pam_filter != PamFilter::NONE &&
-                               config.pam_filter != PamFilter::ANY &&
-                               config.compute_mismatches);
+        const bool enable_lazy_pam = config.pam.filtering_enabled() && config.compute_mismatches;
 
         if (enable_lazy_pam) {
-            // Step 1: Extract PAM only for all hits (cheap - just genome slicing) - PARALLEL
             parallel_process_hits(result.hits,
                 [&](SearchHit& hit) {
-                    extract_pam_only(view, hit, spacer.sequence.size());
+                    extract_pam_bases(view, hit, spacer.sequence.size(), config.pam);
                 },
                 num_threads);
 
-            // Step 2: Filter by PAM early (discards ~93% of hits for NGG filter)
             std::vector<SearchHit> filtered_hits;
-            filtered_hits.reserve(result.hits.size() / 10);  // Expect ~10% to pass
+            filtered_hits.reserve(result.hits.size() / 10);
 
             for (auto& hit : result.hits) {
-                if (matches_pam_filter(hit.mismatch_info.pam_type, config.pam_filter)) {
+                if (pam_matches_pattern(hit.mismatch_info.pam_sequence, config.pam.pattern)) {
                     filtered_hits.push_back(std::move(hit));
                 }
             }
 
             result.hits = std::move(filtered_hits);
 
-            // Step 3: Extract full mismatch info only for passing hits - PARALLEL
             parallel_process_hits(result.hits,
                 [&](SearchHit& hit) {
-                    extract_mismatch_info(spacer.sequence, view, hit);
+                    extract_mismatch_info(spacer.sequence, view, config.pam, hit);
                 },
                 num_threads);
         } else {
-            // Original path: Extract full mismatch info for all hits - PARALLEL
             if (config.compute_mismatches) {
                 parallel_process_hits(result.hits,
                     [&](SearchHit& hit) {
-                        extract_mismatch_info(spacer.sequence, view, hit);
+                        extract_mismatch_info(spacer.sequence, view, config.pam, hit);
                     },
                     num_threads);
             }
         }
 
-        // Deduplicate overlapping semi-global alignment hits
-        // Deduplication is PAM-aware: prefers hits with valid PAMs when distance is tied
-        if (!config.disable_deduplication) {
-            result.hits = deduplicate_hits(std::move(result.hits), spacer.sequence.size());
+        // Deduplicate overlapping alignment hits (Levenshtein only).
+        // Hamming mode has no halo — skip. Levenshtein: radius = threshold+1.
+        if (!config.disable_deduplication && config.distance_mode == DistanceMode::LEVENSHTEIN) {
+            result.hits = deduplicate_hits(std::move(result.hits),
+                                           static_cast<size_t>(config.threshold) + 1);
         }
 
         // Compute CFD scores if requested - PARALLEL
         if (config.compute_scores && config.compute_mismatches) {
+            auto score_t0 = std::chrono::high_resolution_clock::now();
             parallel_process_hits(result.hits,
                 [&](SearchHit& hit) {
                     hit.scoring_info.cfd_score = cfd::compute_cfd_score(
                         spacer.sequence, hit.mismatch_info);
-                    hit.scoring_info.risk_tier = cfd::classify_risk_tier(
-                        hit.scoring_info.cfd_score);
                 },
                 num_threads);
+            batch_result.scoring_time_ms += std::chrono::duration<double, std::milli>(
+                std::chrono::high_resolution_clock::now() - score_t0).count();
         }
 
         // PAM filtering already done above in lazy path
@@ -1536,11 +1312,6 @@ static BatchSearchResult search_genome_batch_gpu(
     auto end_time = std::chrono::high_resolution_clock::now();
     batch_result.total_time_ms = std::chrono::duration<double, std::milli>(
         end_time - start_time).count();
-
-    // Compute MIT specificity scores if requested
-    if (config.compute_mit_score && config.compute_scores) {
-        compute_batch_mit_scores(batch_result);
-    }
 
     return batch_result;
 }
@@ -1598,10 +1369,11 @@ BatchSearchResult search_genome_batch(const BatchSearchConfig& config,
     // Synchronization primitives
     std::mutex gpu_mutex;           // Serialize GPU access
     std::mutex output_mutex;        // Protect verbose output
-    std::atomic<size_t> next_index{0};      // Work queue index (atomic for work-stealing)
-    std::atomic<size_t> completed{0};       // Progress counter
-    std::atomic<size_t> total_hits{0};      // Accumulate total hits
-    std::atomic<bool> any_used_gpu{false};  // Track if any spacer used GPU
+    std::atomic<size_t> next_index{0};       // Work queue index (atomic for work-stealing)
+    std::atomic<size_t> completed{0};        // Progress counter
+    std::atomic<size_t> total_hits{0};       // Accumulate total hits
+    std::atomic<bool>   any_used_gpu{false}; // Track if any spacer used GPU
+    std::atomic<int64_t> total_scoring_us{0}; // Accumulate CFD scoring time (microseconds)
 
     // Worker function - each thread runs this
     auto worker = [&]() {
@@ -1622,7 +1394,7 @@ BatchSearchResult search_genome_batch(const BatchSearchConfig& config,
             single_config.reverse_only = config.reverse_only;
             single_config.compute_mismatches = config.compute_mismatches;
             single_config.compute_scores = config.compute_scores;
-            single_config.pam_filter = config.pam_filter;
+            single_config.pam = config.pam;
             single_config.max_hits = config.max_hits_per_spacer;
 
             SearchResult result;
@@ -1652,6 +1424,8 @@ BatchSearchResult search_genome_batch(const BatchSearchConfig& config,
             if (spacer_result.result.used_gpu) {
                 any_used_gpu.store(true);
             }
+            total_scoring_us += static_cast<int64_t>(
+                spacer_result.result.scoring_time_ms * 1000.0);
 
             // Store result at correct index (no mutex needed - each index is unique)
             batch_result.spacer_results[i] = std::move(spacer_result);
@@ -1685,15 +1459,11 @@ BatchSearchResult search_genome_batch(const BatchSearchConfig& config,
     // Finalize batch result from atomics
     batch_result.total_hits = total_hits.load();
     batch_result.used_gpu = any_used_gpu.load();
+    batch_result.scoring_time_ms = total_scoring_us.load() / 1000.0;
 
     auto end_time = std::chrono::high_resolution_clock::now();
     batch_result.total_time_ms = std::chrono::duration<double, std::milli>(
         end_time - start_time).count();
-
-    // Compute MIT specificity scores if requested
-    if (config.compute_mit_score && config.compute_scores) {
-        compute_batch_mit_scores(batch_result);
-    }
 
     return batch_result;
 }
@@ -1701,16 +1471,10 @@ BatchSearchResult search_genome_batch(const BatchSearchConfig& config,
 std::string format_batch_hits_tsv(const BatchSearchResult& result) {
     std::ostringstream oss;
 
-    // Header with spacer column first and new biologically-meaningful columns
     oss << "spacer\tchrom\tstart\tend\tpattern\tdistance\tstrand\t"
-        << "aligned_seq\tmismatch_pos\tedit_types\tcigar\t"
-        << "pam_seq\tpam_type\t"
-        << "seed_edits\tdistal_edits\t"
-        << "seed_mismatches\tseed_dna_bulges\tseed_rna_bulges\t"
-        << "distal_mismatches\tdistal_dna_bulges\tdistal_rna_bulges\t"
+        << "aligned_seq\tcigar\tpam_seq\t"
         << "alignment_ambiguous\tn_ambiguous_cells\t"
-        << "cfd_score\trisk_tier\t"
-        << "mit_specificity\tspecificity_tier\n";
+        << "cfd_score\n";
 
     for (const auto& spacer_result : result.spacer_results) {
         const auto& pattern = spacer_result.spacer_sequence;
@@ -1730,25 +1494,11 @@ std::string format_batch_hits_tsv(const BatchSearchResult& result) {
                 << static_cast<int>(hit.distance) << '\t'
                 << static_cast<char>(hit.strand) << '\t'
                 << (hit.mismatch_info.aligned_sequence.empty() ? "." : hit.mismatch_info.aligned_sequence) << '\t'
-                << format_mismatch_positions(hit.mismatch_info.mismatch_positions) << '\t'
-                << format_edit_types(hit.mismatch_info.edit_types) << '\t'
                 << (hit.mismatch_info.cigar.empty() ? "." : hit.mismatch_info.cigar) << '\t'
                 << (hit.mismatch_info.pam_sequence.empty() ? "." : hit.mismatch_info.pam_sequence) << '\t'
-                << pam_type_str(hit.mismatch_info.pam_type) << '\t'
-                << static_cast<int>(hit.mismatch_info.total_seed_edits()) << '\t'
-                << static_cast<int>(hit.mismatch_info.total_distal_edits()) << '\t'
-                << static_cast<int>(hit.mismatch_info.seed_mismatches) << '\t'
-                << static_cast<int>(hit.mismatch_info.seed_dna_bulges) << '\t'
-                << static_cast<int>(hit.mismatch_info.seed_rna_bulges) << '\t'
-                << static_cast<int>(hit.mismatch_info.distal_mismatches) << '\t'
-                << static_cast<int>(hit.mismatch_info.distal_dna_bulges) << '\t'
-                << static_cast<int>(hit.mismatch_info.distal_rna_bulges) << '\t'
                 << (hit.mismatch_info.alignment_is_ambiguous ? "true" : "false") << '\t'
                 << static_cast<int>(hit.mismatch_info.n_ambiguous_cells) << '\t'
-                << hit.scoring_info.cfd_score << '\t'
-                << risk_tier_str(hit.scoring_info.risk_tier) << '\t'
-                << spacer_result.mit_specificity_score << '\t'
-                << specificity_tier_str(spacer_result.specificity_tier) << '\n';
+                << hit.scoring_info.cfd_score << '\n';
         }
     }
 
@@ -1801,10 +1551,7 @@ std::string format_batch_hits_json(const BatchSearchResult& result) {
                 << "\"spacer\":\""          << json_escape(spacer_result.spacer_name) << "\","
                 << "\"spacer_sequence\":\"" << json_escape(pattern) << "\",";
             write_hit_body_json(oss, hit, pattern);
-            oss << ","
-                << "\"mit_specificity\":"   << spacer_result.mit_specificity_score << ","
-                << "\"specificity_tier\":\"" << specificity_tier_str(spacer_result.specificity_tier) << "\""
-                << "}";
+            oss << "}";
         }
     }
     if (!first) oss << "\n";

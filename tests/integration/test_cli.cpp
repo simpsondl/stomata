@@ -288,27 +288,27 @@ TEST_CASE("CLI - strand flag searches specific strand", "[cli][strand]") {
 }
 
 TEST_CASE("CLI - pam-filter none (default)", "[cli][pam]") {
-    auto result = run_command(kCystidiaExe + " --pattern ACGTACGTACGTACGTACGT --genome " + kTestSmallFa + " --threshold 5 --pam-filter none");
+    auto result = run_command(kCystidiaExe + " --pattern ACGTACGTACGTACGTACGT --genome " + kTestSmallFa + " --threshold 5");
 
     REQUIRE(result.exit_code == 0);
     // Should work without error
 }
 
 TEST_CASE("CLI - pam-filter both", "[cli][pam]") {
-    auto result = run_command(kCystidiaExe + " --pattern ACGTACGTACGTACGTACGT --genome " + kTestSmallFa + " --threshold 5 --pam-filter both");
+    auto result = run_command(kCystidiaExe + " --pattern ACGTACGTACGTACGTACGT --genome " + kTestSmallFa + " --threshold 5 --pam NRG");
 
     REQUIRE(result.exit_code == 0);
     // Test data likely has no NGG/NAG PAMs, so may return 0 hits (but should not error)
 }
 
 TEST_CASE("CLI - pam-filter ngg", "[cli][pam]") {
-    auto result = run_command(kCystidiaExe + " --pattern ACGTACGTACGTACGTACGT --genome " + kTestSmallFa + " --threshold 5 --pam-filter ngg");
+    auto result = run_command(kCystidiaExe + " --pattern ACGTACGTACGTACGTACGT --genome " + kTestSmallFa + " --threshold 5 --pam NGG");
 
     REQUIRE(result.exit_code == 0);
 }
 
 TEST_CASE("CLI - pam-filter nag", "[cli][pam]") {
-    auto result = run_command(kCystidiaExe + " --pattern ACGTACGTACGTACGTACGT --genome " + kTestSmallFa + " --threshold 5 --pam-filter nag");
+    auto result = run_command(kCystidiaExe + " --pattern ACGTACGTACGTACGTACGT --genome " + kTestSmallFa + " --threshold 5 --pam NAG");
 
     REQUIRE(result.exit_code == 0);
 }
@@ -322,18 +322,19 @@ TEST_CASE("CLI - no-compute-mismatches disables mismatch info", "[cli][mismatche
 }
 
 TEST_CASE("CLI - pam-filter requires compute-mismatches", "[cli][pam][error]") {
-    auto result = run_command(kCystidiaExe + " --pattern ACGTACGTACGTACGTACGT --genome " + kTestSmallFa + " --threshold 5 --pam-filter both --no-compute-mismatches");
+    auto result = run_command(kCystidiaExe + " --pattern ACGTACGTACGTACGTACGT --genome " + kTestSmallFa + " --threshold 5 --pam NRG --no-compute-mismatches");
 
     // Should fail with error
     REQUIRE(result.exit_code != 0);
-    REQUIRE(result.stderr_text.find("PAM filtering requires") != std::string::npos);
+    REQUIRE(result.stderr_text.find("--pam requires") != std::string::npos);
 }
 
-TEST_CASE("CLI - invalid pam-filter value", "[cli][pam][error]") {
-    auto result = run_command(kCystidiaExe + " --pattern ACGT --genome " + kTestSmallFa + " --pam-filter invalid");
+TEST_CASE("CLI - invalid pam pattern", "[cli][pam][error]") {
+    // Non-IUPAC character in --pam pattern
+    auto result = run_command(kCystidiaExe + " --pattern ACGT --genome " + kTestSmallFa + " --pam XYZ");
 
     REQUIRE(result.exit_code != 0);
-    REQUIRE(result.stderr_text.find("pam-filter") != std::string::npos);
+    REQUIRE(result.stderr_text.find("--pam") != std::string::npos);
 }
 
 TEST_CASE("CLI - invalid strand value", "[cli][strand][error]") {
@@ -442,7 +443,7 @@ TEST_CASE("CLI - batch mode max-hits applies per spacer", "[cli][batch]") {
 
 TEST_CASE("CLI - batch mode pam-filter works", "[cli][batch]") {
     auto result = run_command(kCystidiaExe + " --spacer-file " + kTestSpacersFile +
-                              " --genome " + kTestSmallFa + " --threshold 4 --pam-filter both --quiet");
+                              " --genome " + kTestSmallFa + " --threshold 4 --pam NRG --quiet");
 
     REQUIRE(result.exit_code == 0);
     // Should work without error (may have 0 hits if no NGG/NAG PAMs in test data)
@@ -509,18 +510,18 @@ TEST_CASE("CLI - help shows threads option", "[cli][help]") {
 
 TEST_CASE("CLI - --strand plus excludes minus hits", "[cli][strand]") {
     auto result_both = run_command(kCystidiaExe + " --genome " + kTestSmallFa
-        + " --pattern ACGTACGTAC --threshold 2 --pam-filter none --quiet");
+        + " --pattern ACGTACGTAC --threshold 2 --quiet");
     REQUIRE(result_both.exit_code == 0);
 
     auto result_plus = run_command(kCystidiaExe + " --genome " + kTestSmallFa
-        + " --pattern ACGTACGTAC --threshold 2 --pam-filter none --strand plus --quiet");
+        + " --pattern ACGTACGTAC --threshold 2 --strand plus --quiet");
     REQUIRE(result_plus.exit_code == 0);
     REQUIRE(result_plus.stdout_text.find("\t-\t") == std::string::npos);
 }
 
 TEST_CASE("CLI - --strand minus excludes plus hits", "[cli][strand]") {
     auto result_minus = run_command(kCystidiaExe + " --genome " + kTestSmallFa
-        + " --pattern ACGTACGTAC --threshold 2 --pam-filter none --strand minus --quiet");
+        + " --pattern ACGTACGTAC --threshold 2 --strand minus --quiet");
     REQUIRE(result_minus.exit_code == 0);
     REQUIRE(result_minus.stdout_text.find("\t+\t") == std::string::npos);
 }
@@ -540,12 +541,12 @@ TEST_CASE("CLI - strand in help text", "[cli][strand]") {
 TEST_CASE("CLI - treat-u-as-t (default enabled)", "[cli][uracil]") {
     // Pattern with U should work by default
     auto result = run_command(kCystidiaExe + " --genome " + kTestSmallFa
-        + " --pattern ACGUACGUAC --threshold 2 --pam-filter none --quiet");
+        + " --pattern ACGUACGUAC --threshold 2 --quiet");
     REQUIRE(result.exit_code == 0);
 
     // Compare with T version - should produce same hits
     auto result_t = run_command(kCystidiaExe + " --genome " + kTestSmallFa
-        + " --pattern ACGTACGTAC --threshold 2 --pam-filter none --quiet");
+        + " --pattern ACGTACGTAC --threshold 2 --quiet");
     REQUIRE(result_t.exit_code == 0);
 
     // Count lines (excluding header)
@@ -570,7 +571,7 @@ TEST_CASE("CLI - no-treat-u-as-t rejects U", "[cli][uracil]") {
 
 TEST_CASE("CLI - summary mode JSON output", "[cli][summary]") {
     auto result = run_command(kCystidiaExe + " --genome " + kTestSmallFa
-        + " --pattern ACGTACGTAC --threshold 2 --pam-filter none --summary --quiet");
+        + " --pattern ACGTACGTAC --threshold 2 --summary --quiet");
     REQUIRE(result.exit_code == 0);
 
     // Should contain JSON structure
@@ -581,7 +582,7 @@ TEST_CASE("CLI - summary mode JSON output", "[cli][summary]") {
 
 TEST_CASE("CLI - summary mode TSV output", "[cli][summary]") {
     auto result = run_command(kCystidiaExe + " --genome " + kTestSmallFa
-        + " --pattern ACGTACGTAC --threshold 2 --pam-filter none --summary --summary-format tsv --quiet");
+        + " --pattern ACGTACGTAC --threshold 2 --summary --summary-format tsv --quiet");
     REQUIRE(result.exit_code == 0);
 
     // Should contain TSV header with distance columns
@@ -592,7 +593,7 @@ TEST_CASE("CLI - summary mode TSV output", "[cli][summary]") {
 TEST_CASE("CLI - summary mode with batch", "[cli][summary]") {
     std::string spacer_file = TEST_DATA_DIR "/synthetic/test_spacers.txt";
     auto result = run_command(kCystidiaExe + " --genome " + kTestSmallFa
-        + " --spacer-file " + spacer_file + " --threshold 2 --pam-filter none --summary --quiet");
+        + " --spacer-file " + spacer_file + " --threshold 2 --summary --quiet");
     REQUIRE(result.exit_code == 0);
 
     // Should contain JSON with spacers array
@@ -601,7 +602,7 @@ TEST_CASE("CLI - summary mode with batch", "[cli][summary]") {
 
 TEST_CASE("CLI - summary combined with --strand plus", "[cli][summary][strand]") {
     auto result = run_command(kCystidiaExe + " --genome " + kTestSmallFa
-        + " --pattern ACGTACGTAC --threshold 2 --pam-filter none --summary --strand plus --quiet");
+        + " --pattern ACGTACGTAC --threshold 2 --summary --strand plus --quiet");
     REQUIRE(result.exit_code == 0);
 
     // Should still produce valid JSON summary
@@ -614,9 +615,9 @@ TEST_CASE("CLI - summary combined with --strand plus", "[cli][summary][strand]")
 
 TEST_CASE("CLI - distance-mode levenshtein is default", "[cli][distance-mode]") {
     auto result_default = run_command(kCystidiaExe + " --pattern ACGTACGTAC --genome " + kTestSmallFa
-        + " --threshold 2 --pam-filter none --quiet");
+        + " --threshold 2 --quiet");
     auto result_explicit = run_command(kCystidiaExe + " --pattern ACGTACGTAC --genome " + kTestSmallFa
-        + " --threshold 2 --pam-filter none --distance-mode levenshtein --quiet");
+        + " --threshold 2 --distance-mode levenshtein --quiet");
 
     REQUIRE(result_default.exit_code == 0);
     REQUIRE(result_explicit.exit_code == 0);
@@ -625,7 +626,7 @@ TEST_CASE("CLI - distance-mode levenshtein is default", "[cli][distance-mode]") 
 
 TEST_CASE("CLI - distance-mode hamming produces no indels", "[cli][distance-mode]") {
     auto result = run_command(kCystidiaExe + " --pattern ACGTACGTAC --genome " + kTestSmallFa
-        + " --threshold 2 --pam-filter none --distance-mode hamming --quiet");
+        + " --threshold 2 --distance-mode hamming --quiet");
     REQUIRE(result.exit_code == 0);
 
     // Hamming results should contain no DNA_BULGE or RNA_BULGE CIGAR operations.
@@ -640,7 +641,7 @@ TEST_CASE("CLI - distance-mode hamming excludes indel-only hits", "[cli][distanc
     // Hamming mode must never emit a hit whose edit_types column contains
     // DNA_BULGE or RNA_BULGE — those are indels, which Hamming distance forbids.
     auto ham = run_command(kCystidiaExe + " --pattern ACGTACGTAC --genome " + kTestSmallFa
-        + " --threshold 3 --pam-filter none --distance-mode hamming --quiet");
+        + " --threshold 3 --distance-mode hamming --quiet");
 
     REQUIRE(ham.exit_code == 0);
     REQUIRE(ham.stdout_text.find("DNA_BULGE") == std::string::npos);
@@ -711,7 +712,7 @@ TEST_CASE("CLI - empty spacer file produces clear error", "[cli][batch][error]")
 
 TEST_CASE("CLI - no-deduplicate is accepted and works", "[cli][debug]") {
     auto result = run_command(kCystidiaExe + " --pattern ACGTACGTAC --genome " + kTestSmallFa
-        + " --threshold 2 --pam-filter none --no-deduplicate --quiet");
+        + " --threshold 2 --no-deduplicate --quiet");
     REQUIRE(result.exit_code == 0);
 }
 
@@ -727,7 +728,7 @@ TEST_CASE("CLI - no-deduplicate documented in help", "[cli][help]") {
 
 TEST_CASE("CLI - TSV output includes cigar column", "[cli][cigar]") {
     auto result = run_command(kCystidiaExe + " --pattern ACGTACGTAC --genome " + kTestSmallFa
-        + " --threshold 0 --pam-filter none --quiet");
+        + " --threshold 0 --quiet");
     REQUIRE(result.exit_code == 0);
     REQUIRE(result.stdout_text.find("cigar") != std::string::npos);
     // Exact matches at threshold 0 should produce "10M"
@@ -736,7 +737,7 @@ TEST_CASE("CLI - TSV output includes cigar column", "[cli][cigar]") {
 
 TEST_CASE("CLI - cigar column present in batch TSV output", "[cli][cigar][batch]") {
     auto result = run_command(kCystidiaExe + " --spacer-file " + kTestSpacersFile
-        + " --genome " + kTestSmallFa + " --threshold 2 --pam-filter none --quiet");
+        + " --genome " + kTestSmallFa + " --threshold 2 --quiet");
     REQUIRE(result.exit_code == 0);
     REQUIRE(result.stdout_text.find("cigar") != std::string::npos);
 }
@@ -747,7 +748,7 @@ TEST_CASE("CLI - cigar column present in batch TSV output", "[cli][cigar][batch]
 
 TEST_CASE("CLI - JSON output format produces valid-looking JSON array", "[cli][format][json]") {
     auto result = run_command(kCystidiaExe + " --pattern ACGTACGTAC --genome " + kTestSmallFa
-        + " --threshold 0 --pam-filter none --format json --quiet");
+        + " --threshold 0 --format json --quiet");
     REQUIRE(result.exit_code == 0);
     // Starts with '[' and ends with ']' + newline
     REQUIRE(!result.stdout_text.empty());
@@ -761,16 +762,16 @@ TEST_CASE("CLI - JSON output format produces valid-looking JSON array", "[cli][f
 
 TEST_CASE("CLI - batch JSON format includes spacer field", "[cli][format][json][batch]") {
     auto result = run_command(kCystidiaExe + " --spacer-file " + kTestSpacersFile
-        + " --genome " + kTestSmallFa + " --threshold 2 --pam-filter none --format json --quiet");
+        + " --genome " + kTestSmallFa + " --threshold 2 --format json --quiet");
     REQUIRE(result.exit_code == 0);
     REQUIRE(result.stdout_text.front() == '[');
     REQUIRE(result.stdout_text.find("\"spacer\"") != std::string::npos);
-    REQUIRE(result.stdout_text.find("\"mit_specificity\"") != std::string::npos);
+    REQUIRE(result.stdout_text.find("\"cfd_score\"") != std::string::npos);
 }
 
 TEST_CASE("CLI - JSON format with zero hits emits empty array", "[cli][format][json]") {
     auto result = run_command(kCystidiaExe + " --pattern TTTTTTTTTT --genome " + kTestSmallFa
-        + " --threshold 0 --pam-filter none --format json --quiet");
+        + " --threshold 0 --format json --quiet");
     REQUIRE(result.exit_code == 0);
     // Empty array: "[]\n"
     REQUIRE(result.stdout_text == "[]\n");
@@ -798,9 +799,9 @@ TEST_CASE("CLI - region restricts to chromosome", "[cli][region]") {
     // Whole-genome search returns hits in multiple chromosomes; restricting to
     // chr1 should drop any chr2/chr3 hits.
     auto all = run_command(kCystidiaExe + " --pattern ACGTACGTAC --genome " + kTestSmallFa
-        + " --threshold 1 --pam-filter none --quiet");
+        + " --threshold 1 --quiet");
     auto chr1_only = run_command(kCystidiaExe + " --pattern ACGTACGTAC --genome " + kTestSmallFa
-        + " --threshold 1 --pam-filter none --region chr1 --quiet");
+        + " --threshold 1 --region chr1 --quiet");
     REQUIRE(all.exit_code == 0);
     REQUIRE(chr1_only.exit_code == 0);
     // chr1 output should not reference chr2/chr3.
@@ -810,7 +811,7 @@ TEST_CASE("CLI - region restricts to chromosome", "[cli][region]") {
 
 TEST_CASE("CLI - region with explicit window restricts positions", "[cli][region]") {
     auto result = run_command(kCystidiaExe + " --pattern ACGTACGTAC --genome " + kTestSmallFa
-        + " --threshold 0 --pam-filter none --region chr1:50-95 --quiet");
+        + " --threshold 0 --region chr1:50-95 --quiet");
     REQUIRE(result.exit_code == 0);
     // Any returned hit must have end position <= 95 (the exclusive end of the window).
     // A trivial lower-bound check: the output should not contain early positions like
@@ -820,7 +821,7 @@ TEST_CASE("CLI - region with explicit window restricts positions", "[cli][region
 
 TEST_CASE("CLI - region with unknown chromosome fails", "[cli][region][error]") {
     auto result = run_command(kCystidiaExe + " --pattern ACGTACGTAC --genome " + kTestSmallFa
-        + " --threshold 1 --pam-filter none --region chrBOGUS --quiet");
+        + " --threshold 1 --region chrBOGUS --quiet");
     REQUIRE(result.exit_code != 0);
     REQUIRE(result.stderr_text.find("chrBOGUS") != std::string::npos);
 }
@@ -828,7 +829,7 @@ TEST_CASE("CLI - region with unknown chromosome fails", "[cli][region][error]") 
 TEST_CASE("CLI - region with invalid range fails", "[cli][region][error]") {
     // End before start must be rejected.
     auto result = run_command(kCystidiaExe + " --pattern ACGTACGTAC --genome " + kTestSmallFa
-        + " --threshold 1 --pam-filter none --region chr1:100-50 --quiet");
+        + " --threshold 1 --region chr1:100-50 --quiet");
     REQUIRE(result.exit_code != 0);
 }
 
@@ -839,11 +840,11 @@ TEST_CASE("CLI - region with invalid range fails", "[cli][region][error]") {
 TEST_CASE("CLI - max-total-hits caps batch hits globally", "[cli][batch][max-total-hits]") {
     // Run uncapped first to confirm there are > 2 hits to cap.
     auto uncapped = run_command(kCystidiaExe + " --spacer-file " + kTestSpacersFile
-        + " --genome " + kTestSmallFa + " --threshold 3 --pam-filter none --quiet");
+        + " --genome " + kTestSmallFa + " --threshold 3 --quiet");
     REQUIRE(uncapped.exit_code == 0);
 
     auto capped = run_command(kCystidiaExe + " --spacer-file " + kTestSpacersFile
-        + " --genome " + kTestSmallFa + " --threshold 3 --pam-filter none --max-total-hits 2 --quiet");
+        + " --genome " + kTestSmallFa + " --threshold 3 --max-total-hits 2 --quiet");
     REQUIRE(capped.exit_code == 0);
 
     // Count data lines (excluding header) in each TSV.
@@ -872,7 +873,7 @@ TEST_CASE("CLI - spacer-file dash reads spacers from stdin", "[cli][batch][stdin
     // Pipe two spacers via stdin.
     std::string cmd = "printf 'stdin_spacer\\tACGTACGTAC\\n' | " + kCystidiaExe
         + " --spacer-file - --genome " + kTestSmallFa
-        + " --threshold 1 --pam-filter none --quiet";
+        + " --threshold 1 --quiet";
     auto result = run_command(cmd);
     REQUIRE(result.exit_code == 0);
     REQUIRE(result.stdout_text.find("stdin_spacer") != std::string::npos);

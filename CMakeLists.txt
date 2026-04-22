@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(Cystidia VERSION 0.5.0 LANGUAGES CXX CUDA)
+project(Cystidia VERSION 0.6.0 LANGUAGES CXX CUDA)
 
 # C++17 required
 # Use explicit compiler flags for C++ to avoid CMake's feature-mapping
@@ -32,3 +32,4 @@ if(Catch2_FOUND)
 else()
     message(WARNING "Catch2 not found. Tests will not be built. Install with: conda install -c conda-forge catch2")
 endif()
+

@@ -20,22 +20,38 @@ enum class Strand : char {
     MINUS = '-'
 };
 
-// PAM sequence type classification.
-enum class PamType : uint8_t {
-    NGG,         // NGG PAM (preferred SpCas9)
-    NAG,         // NAG PAM (alternative SpCas9)
-    OTHER,       // Other PAM sequence (not NGG/NAG)
-    INCOMPLETE   // PAM at genome boundary (< 3 bases)
+// PAM position relative to the spacer.
+// Cas9 / Cas12 / base editors disagree on which side of the spacer the PAM sits;
+// Cystidia is PAM-agnostic, so the user specifies the position along with the pattern.
+enum class PamPosition : uint8_t {
+    THREE_PRIME,  // PAM follows the spacer (e.g. SpCas9: 5'-[spacer]-NGG-3')
+    FIVE_PRIME    // PAM precedes the spacer (e.g. Cas12a: 5'-TTTV-[spacer]-3')
 };
 
-// PAM filter type for CRISPR off-target search.
-// Controls which PAM sequences are retained in results.
-enum class PamFilter : uint8_t {
-    NONE,         // No filtering (report all hits regardless of PAM)
-    NGG_ONLY,     // Only NGG PAMs
-    NAG_ONLY,     // Only NAG PAMs
-    NGG_OR_NAG,   // NGG or NAM PAMs (standard SpCas9, default)
-    ANY           // Same as NONE (for clarity in user-facing options)
+// Pluggable PAM specification: IUPAC pattern + position + extraction length.
+// Empty pattern means no PAM filter and no extraction.
+// extract_length > 0 overrides the auto-derived length (= pattern.size()); use it
+// when you want to annotate PAM context wider than the filter pattern.
+struct PamSpec {
+    std::string  pattern;
+    PamPosition  position = PamPosition::THREE_PRIME;
+    size_t       extract_length = 0;
+
+    bool filtering_enabled() const { return !pattern.empty(); }
+    size_t effective_extract_length() const {
+        return extract_length > 0 ? extract_length : pattern.size();
+    }
+};
+
+// Internal PAM classification used only by the (SpCas9-biased) halo deduplicator.
+// TODO: superseded when the dedup logic is revisited — PAM priority here is
+// tech-specific and contradicts the PAM-agnostic design. Kept dormant for
+// non-3'-PAM searches (see classify_pam in search_pipeline.cpp).
+enum class PamType : uint8_t {
+    NGG,
+    NAG,
+    OTHER,
+    INCOMPLETE
 };
 
 // Distance metric mode for pattern matching.
@@ -45,70 +61,36 @@ enum class DistanceMode : uint8_t {
     HAMMING       // Substitution-only distance (no indels/bulges) - faster, simpler
 };
 
-// Type of alignment difference at a position.
-// Used to annotate mismatches, insertions, and deletions.
-enum class EditType : uint8_t {
-    NONE       = 0,  // No difference (match)
-    MISMATCH   = 1,  // Substitution (different bases)
-    DNA_BULGE  = 2,  // Insertion in DNA/genome (deletion in pattern/RNA)
-    RNA_BULGE  = 3   // Insertion in RNA/pattern (deletion in DNA/genome)
-};
-
-// Alignment operation for traceback
+// Alignment operation for traceback.
 enum class AlignOp : uint8_t {
     MATCH,      // Match or mismatch (diagonal move)
     INS_TEXT,   // Insertion in text/genome (horizontal move) = DNA bulge
     INS_PATTERN // Insertion in pattern/RNA (vertical move) = RNA bulge
 };
 
-// Detailed annotation information for a single hit.
-// Provides biologically-meaningful summary counts for CRISPR analysis.
-// For a spacer of length m:
-//   - DISTAL region: positions 1 to (m-8), distal from PAM
-//   - SEED region:   positions (m-7) to m, proximal to PAM (8 nt)
+// Per-hit alignment annotation.
+// Position-level detail is carried by the CIGAR string (M = match/mismatch,
+// I = RNA bulge, D = DNA bulge); downstream callers parse the CIGAR for
+// anything finer-grained.
 struct MismatchInfo {
-    std::string           aligned_sequence;         // Genome sequence at hit (spacer region)
-    std::string           pam_sequence;             // 3 bases following spacer
-    PamType               pam_type = PamType::OTHER;  // PAM classification (NGG/NAG/OTHER/INCOMPLETE)
-    
-    // Position-level detail (for advanced analysis)
-    std::vector<uint8_t>  mismatch_positions;       // 1-based positions in spacer with edits
-    std::vector<EditType> edit_types;               // Type of edit at each mismatch position
-    
-    // Biologically-meaningful summary counts
-    uint8_t seed_mismatches      = 0;  // Count of mismatches in seed region
-    uint8_t seed_dna_bulges      = 0;  // Count of DNA bulges in seed region
-    uint8_t seed_rna_bulges      = 0;  // Count of RNA bulges in seed region
-    uint8_t distal_mismatches    = 0;  // Count of mismatches in distal region
-    uint8_t distal_dna_bulges    = 0;  // Count of DNA bulges in distal region
-    uint8_t distal_rna_bulges    = 0;  // Count of RNA bulges in distal region
-    
-    // Alignment metadata
-    bool        alignment_is_ambiguous  = false;  // True if multiple optimal alignments exist
-    uint16_t    n_ambiguous_cells       = 0;      // Traceback cells where >1 op was co-optimal
-    std::string cigar;                             // CIGAR-style string: M (match/mismatch), I (RNA bulge), D (DNA bulge)
+    std::string aligned_sequence;                 // Genome sequence at hit (spacer region)
+    std::string pam_sequence;                     // Extracted PAM bases (length = PamSpec extract length)
+    std::string cigar;                            // M / I / D run-length CIGAR
 
-    // Helper methods for common queries
-    uint8_t total_mismatches() const { return seed_mismatches + distal_mismatches; }
-    uint8_t total_dna_bulges() const { return seed_dna_bulges + distal_dna_bulges; }
-    uint8_t total_rna_bulges() const { return seed_rna_bulges + distal_rna_bulges; }
-    uint8_t total_seed_edits() const { return seed_mismatches + seed_dna_bulges + seed_rna_bulges; }
-    uint8_t total_distal_edits() const { return distal_mismatches + distal_dna_bulges + distal_rna_bulges; }
-    bool has_dna_bulge() const { return (seed_dna_bulges + distal_dna_bulges) > 0; }
-    bool has_rna_bulge() const { return (seed_rna_bulges + distal_rna_bulges) > 0; }
+    bool     alignment_is_ambiguous = false;      // True if multiple optimal alignments exist
+    uint16_t n_ambiguous_cells      = 0;          // Traceback cells where >1 op was co-optimal
+
+    PamType  pam_type = PamType::OTHER;           // Internal dedup only; not exposed in output
 };
 
-// Scoring information for a single hit.
-// Contains CFD (Cutting Frequency Determination) score and derived metrics.
-// CFD scores predict off-target cleavage activity based on Doench et al. 2016.
-struct ScoringInfo {
-    double   cfd_score = 0.0;     // CFD score (0.0-1.0), higher = more likely to cleave
-    uint8_t  risk_tier = 0;       // Risk classification: 0=low, 1=medium, 2=high
+// True when the CIGAR contains any insertion or deletion run.
+bool cigar_has_indel(const std::string& cigar);
 
-    // Helper method
-    bool is_predicted_active(double threshold = 0.1) const {
-        return cfd_score >= threshold;
-    }
+// Scoring information for a single hit.
+// cfd_score is the per-mismatch SpCas9 CFD (Doench et al. 2016); used downstream
+// by the spacer summary layer to compute per-spacer aggregate CFD.
+struct ScoringInfo {
+    double cfd_score = 0.0;  // Per-mismatch CFD (SpCas9; 0.0–1.0)
 };
 
 // A single hit from the search.
@@ -137,9 +119,9 @@ struct SearchConfig {
     DistanceMode distance_mode = DistanceMode::LEVENSHTEIN;  // Distance metric: Levenshtein (default) or Hamming
     bool        prefer_gpu = true;                // Use GPU if available (falls back to CPU)
     bool        search_both_strands = true;       // Search forward and reverse complement
-    bool        compute_mismatches  = true;       // Extract detailed mismatch positions
+    bool        compute_mismatches  = true;       // Extract detailed mismatch info (CIGAR, aligned seq, PAM)
     bool        compute_scores      = true;       // Compute CFD activity scores (requires mismatches)
-    PamFilter   pam_filter = PamFilter::NGG_OR_NAG;  // Filter hits by PAM type (default: NGG or NAG)
+    PamSpec     pam;                              // Pluggable PAM (empty = no filter); see PamSpec
     size_t      max_hits = 0;                     // Maximum hits to report (0 = unlimited)
     bool        forward_only = false;             // When true, skip reverse-complement search entirely
     bool        reverse_only = false;             // When true, skip forward search entirely (only RC pass runs)
@@ -158,6 +140,7 @@ struct SearchResult {
     std::vector<SearchHit> hits;           // All positions meeting the threshold
     size_t                total_positions; // Total genome positions scanned
     bool                  used_gpu;        // Whether GPU was used for the search
+    double                scoring_time_ms = 0.0; // Time spent computing CFD scores
 };
 
 // Input normalization
@@ -184,13 +167,15 @@ std::tuple<std::string, size_t> resolve_chromosome(
 
 // Hit deduplication
 
-// Deduplicate overlapping semi-global alignment hits.
+// Deduplicate overlapping semi-global alignment hits (Levenshtein/Myers only).
 // Myers' algorithm reports edit distance at every genome position, creating
 // "halos" of low-distance positions around each real match. This function
-// clusters consecutive hits on the same strand (within pattern_len distance)
-// and keeps only the minimum-distance hit per cluster.
+// clusters consecutive hits on the same strand (within dedup_radius positions
+// of each other) and keeps only the minimum-distance hit per cluster.
+// Correct radius for Levenshtein: threshold+1 (halo extends threshold positions).
+// For Hamming mode, skip this call entirely — each position is independent.
 std::vector<SearchHit> deduplicate_hits(std::vector<SearchHit> hits,
-                                         size_t pattern_len);
+                                         size_t dedup_radius);
 
 // Search pipeline
 
@@ -246,10 +231,9 @@ struct BatchSearchConfig {
     DistanceMode distance_mode = DistanceMode::LEVENSHTEIN;  // Distance metric: Levenshtein (default) or Hamming
     bool        prefer_gpu = true;                // Use GPU if available
     bool        search_both_strands = true;       // Search both strands
-    bool        compute_mismatches  = true;       // Extract detailed mismatch info
+    bool        compute_mismatches  = true;       // Extract detailed mismatch info (CIGAR, aligned seq, PAM)
     bool        compute_scores      = true;       // Compute CFD activity scores
-    bool        compute_mit_score   = false;      // Compute MIT specificity scores (requires compute_scores=true)
-    PamFilter   pam_filter = PamFilter::NONE;     // Filter by PAM type
+    PamSpec     pam;                              // Pluggable PAM (empty = no filter); see PamSpec
     size_t      max_hits_per_spacer = 0;          // Max hits per spacer (0 = unlimited)
     bool        verbose = false;                  // Print progress to stderr
     size_t      num_threads = 0;                  // Threads for parallel search (0 = auto)
@@ -268,17 +252,16 @@ struct BatchSpacerResult {
     std::string spacer_name;
     std::string spacer_sequence;
     SearchResult result;
-    double mit_specificity_score = 0.0;  // MIT specificity score (0-100)
-    uint8_t specificity_tier = 0;        // Quality tier: 0=poor, 1=fair, 2=good, 3=excellent
 };
 
 // Result of a batch genome search.
 struct BatchSearchResult {
     std::vector<BatchSpacerResult> spacer_results;
     size_t total_hits = 0;
-    double total_time_ms = 0.0;
+    double total_time_ms = 0.0;   // Search + scoring (wall clock inside search_genome_batch)
+    double scoring_time_ms = 0.0; // CFD scoring only (subset of total_time_ms)
     bool used_gpu = false;
-    size_t spacers_skipped = 0;  // Count of spacers skipped due to validation errors
+    size_t spacers_skipped = 0;
 };
 
 // Parse a spacer file into a vector of SpacerEntry.
@@ -312,7 +295,7 @@ std::string format_batch_hits_bed(const BatchSearchResult& result);
 
 // Format batch results as a JSON array of hit objects (one object per hit).
 // Each object carries the spacer name/sequence plus the same fields as
-// format_hits_json, with added mit_specificity/specificity_tier columns.
+// format_hits_json.
 std::string format_batch_hits_json(const BatchSearchResult& result);
 
 // Summary mode

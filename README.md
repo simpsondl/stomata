@@ -272,16 +272,6 @@ Contributions welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guideli
 
 ---
 
-## History
-
-Cystidia was previously developed and presented under the name **Argus**. An early
-version of this tool was shown as a conference poster under that name. The
-project was renamed to Cystidia for its public release; the algorithms,
-benchmarks, and API surface are the direct continuation of that work. References
-to "Argus" in older talks, posters, or correspondence refer to this project.
-
----
-
 ## Acknowledgments
 
 - **Myers' Algorithm:** Eugene W. Myers (1999) - Bit-parallel approximate string matching

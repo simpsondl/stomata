@@ -1,5 +1,7 @@
 #include <genome_loader.hpp>
 #include <search_pipeline.hpp>
+#include <spacer_summary.hpp>
+#include <annotation_bed.hpp>
 #include <gpu_engine.hpp>
 
 #include <algorithm>
@@ -41,15 +43,23 @@ static void print_usage(const char* program_name) {
               << "                             plus   run only the forward pass; only + hits\n"
               << "                             minus  run only the RC pass; only - hits\n"
               << "\n"
-              << "PAM filtering:\n"
-              << "  --pam-filter FILTER      Filter by PAM type: none (default), ngg, nag, both, any\n"
+              << "PAM filtering (pluggable, cross-technology):\n"
+              << "  --pam PATTERN            IUPAC PAM pattern to filter on (e.g. NGG, TTTV). Empty = no filter.\n"
+              << "  --pam-position POS       PAM position relative to spacer: 3prime (default, Cas9) or 5prime (Cas12)\n"
+              << "  --pam-extract-length N   Width of PAM bases to extract/annotate (default: length of --pam pattern)\n"
               << "  --compute-mismatches     Compute mismatch details (default: true)\n"
               << "  --no-compute-mismatches  Skip mismatch computation\n"
               << "\n"
               << "Activity scoring:\n"
               << "  --compute-scores         Compute CFD activity scores (default: true)\n"
               << "  --no-scores              Disable CFD scoring for faster output\n"
-              << "  --mit-score              Compute MIT specificity scores in batch mode\n"
+              << "\n"
+              << "Spacer summary (per-spacer aggregate report):\n"
+              << "  --spacer-summary FILE    Write per-spacer summary TSV to FILE\n"
+              << "  --acfd-threshold FLOAT   Promiscuity threshold for aggregate CFD (default: 4.8)\n"
+              << "  --intersect-bed LABEL:FILE  Count off-target overlaps with a BED file; repeatable.\n"
+              << "                           LABEL appears as n_LABEL_overlaps in summary output.\n"
+              << "                           Example: --intersect-bed CDS:/path/cds.bed\n"
               << "\n"
               << "Performance options:\n"
               << "  --threads N, -t N        Number of threads for batch processing (0 = auto)\n"
@@ -82,7 +92,7 @@ static void print_usage(const char* program_name) {
               << "Examples:\n"
               << "  " << program_name << " --pattern ACGTACGTACGTACGTACGT --genome hg38.fa --threshold 4\n"
               << "  " << program_name << " --spacer-file guides.txt --genome hg38.fa --threshold 4\n"
-              << "  " << program_name << " --pattern ACGTACGTACGTACGTACGT --genome hg38.fa --pam-filter both --max-hits 1000\n"
+              << "  " << program_name << " --pattern ACGTACGTACGTACGTACGT --genome hg38.fa --pam NGG --max-hits 1000\n"
               << "  " << program_name << " --index-genome hg38.fa                  # Creates hg38.fa.cy\n"
               << "  " << program_name << " --genome hg38.fa.cy --pattern ...    # Uses mmap for fast load\n"
               << "\n"
@@ -94,6 +104,7 @@ static void print_usage(const char* program_name) {
               << "  - Pattern length must be 1-64 for GPU acceleration\n"
               << "  - Patterns longer than 64 bp will use CPU (multi-word Myers)\n"
               << "  - N in the pattern matches any nucleotide at zero cost\n"
+              << "  - --pam accepts IUPAC codes (R, Y, S, W, K, M, B, D, H, V, N); supply one pattern per run\n"
               << "  - PAM filtering requires --compute-mismatches (default on)\n"
               << "  - Batch mode (--spacer-file) loads genome once for all spacers\n"
               << "  - .cy index files are memory-mapped for instant loading\n"
@@ -122,7 +133,9 @@ struct Arguments {
     std::string index_genome;  // Index creation mode: input FASTA path
     std::string output_path;
     std::string format = "tsv";
-    std::string pam_filter = "none";
+    std::string pam_pattern;                   // IUPAC PAM pattern (empty = no filter)
+    std::string pam_position = "3prime";       // 3prime (Cas9) or 5prime (Cas12)
+    size_t      pam_extract_length = 0;        // 0 = use pam_pattern length
     std::string summary_format = "json";
     std::string distance_mode = "levenshtein";  // Distance metric: levenshtein or hamming
     int threshold = 4;
@@ -137,11 +150,13 @@ struct Arguments {
     StrandMode strand_mode = StrandMode::BOTH;
     bool compute_mismatches = true;
     bool compute_scores = true;  // CFD activity scoring (default: on)
-    bool compute_mit_score = false;  // MIT specificity scoring (default: off, only for batch mode)
     bool treat_u_as_t = true;   // Normalize U→T in spacer sequences (default: on)
     bool summary_mode = false;  // Output aggregated counts instead of per-hit details
     bool disable_deduplication = false;  // Skip halo dedup (cross-tool validation).
     size_t num_threads = 0;  // 0 = auto (hardware_concurrency)
+    std::string spacer_summary_path;   // If non-empty, write per-spacer summary TSV here
+    double acfd_threshold = spacer::DEFAULT_ACFD_THRESHOLD;
+    std::vector<std::pair<std::string, std::string>> intersect_beds;  // (label, path)
 };
 
 // Table-driven argument parser.
@@ -232,11 +247,34 @@ const std::vector<OptionDef>& option_table() {
             a.distance_mode = to_lower_copy(v);
             return require_one_of("--distance-mode", a.distance_mode, {"levenshtein", "hamming"}, "'levenshtein' or 'hamming'");
         }},
-        {"--pam-filter", nullptr, true, [](Arguments& a, const char* v){
-            a.pam_filter = to_lower_copy(v);
-            return require_one_of("--pam-filter", a.pam_filter,
-                                  {"none", "ngg", "nag", "both", "any"},
-                                  "'none', 'ngg', 'nag', 'both', or 'any'");
+        {"--pam", nullptr, true, [](Arguments& a, const char* v){
+            a.pam_pattern = v;
+            for (char& c : a.pam_pattern) {
+                c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            }
+            for (char c : a.pam_pattern) {
+                switch (c) {
+                    case 'A': case 'C': case 'G': case 'T': case 'U':
+                    case 'R': case 'Y': case 'S': case 'W': case 'K':
+                    case 'M': case 'B': case 'D': case 'H': case 'V':
+                    case 'N':
+                        break;
+                    default:
+                        std::cerr << "Error: --pam has invalid IUPAC character '" << c << "'\n";
+                        return false;
+                }
+            }
+            return true;
+        }},
+        {"--pam-position", nullptr, true, [](Arguments& a, const char* v){
+            a.pam_position = to_lower_copy(v);
+            return require_one_of("--pam-position", a.pam_position,
+                                  {"3prime", "5prime"}, "'3prime' or '5prime'");
+        }},
+        {"--pam-extract-length", nullptr, true, [](Arguments& a, const char* v){
+            long long n; if (!parse_nonneg_int("--pam-extract-length", v, n)) return false;
+            a.pam_extract_length = static_cast<size_t>(n);
+            return true;
         }},
         {"--strand", nullptr, true, [](Arguments& a, const char* v){
             std::string s = to_lower_copy(v);
@@ -259,10 +297,33 @@ const std::vector<OptionDef>& option_table() {
         {"--no-compute-mismatches", nullptr, false, [](Arguments& a, const char*){ a.compute_mismatches = false; return true; }},
         {"--compute-scores",        nullptr, false, [](Arguments& a, const char*){ a.compute_scores = true;  return true; }},
         {"--no-scores",             nullptr, false, [](Arguments& a, const char*){ a.compute_scores = false; return true; }},
-        {"--mit-score",             nullptr, false, [](Arguments& a, const char*){ a.compute_mit_score = true; return true; }},
         {"--treat-u-as-t",          nullptr, false, [](Arguments& a, const char*){ a.treat_u_as_t = true;  return true; }},
         {"--no-treat-u-as-t",       nullptr, false, [](Arguments& a, const char*){ a.treat_u_as_t = false; return true; }},
         {"--no-deduplicate",        nullptr, false, [](Arguments& a, const char*){ a.disable_deduplication = true; return true; }},
+
+        {"--spacer-summary", nullptr, true,  [](Arguments& a, const char* v){ a.spacer_summary_path = v; return true; }},
+        {"--intersect-bed",  nullptr, true,  [](Arguments& a, const char* v) {
+            std::string s = v;
+            auto colon = s.find(':');
+            if (colon == std::string::npos || colon == 0 || colon + 1 == s.size()) {
+                std::cerr << "Error: --intersect-bed requires LABEL:FILE format\n";
+                return false;
+            }
+            a.intersect_beds.emplace_back(s.substr(0, colon), s.substr(colon + 1));
+            return true;
+        }},
+        {"--acfd-threshold", nullptr, true,  [](Arguments& a, const char* v){
+            try { a.acfd_threshold = std::stod(v); }
+            catch (const std::exception&) {
+                std::cerr << "Error: --acfd-threshold requires a numeric argument\n";
+                return false;
+            }
+            if (a.acfd_threshold < 0.0) {
+                std::cerr << "Error: --acfd-threshold must be non-negative\n";
+                return false;
+            }
+            return true;
+        }},
     };
     return kOptions;
 }
@@ -365,9 +426,8 @@ static bool validate_arguments(const Arguments& args) {
         }
     }
 
-    // Validate PAM filter requires mismatch computation
-    if (args.pam_filter != "none" && args.pam_filter != "any" && !args.compute_mismatches) {
-        std::cerr << "Error: PAM filtering requires --compute-mismatches (default on)\n";
+    if (!args.pam_pattern.empty() && !args.compute_mismatches) {
+        std::cerr << "Error: --pam requires --compute-mismatches (default on)\n";
         return false;
     }
 
@@ -479,12 +539,14 @@ static bool resolve_region(const Arguments& args, const GenomeView& view,
     return true;
 }
 
-static PamFilter pam_filter_from_string(const std::string& s) {
-    if (s == "none") return PamFilter::NONE;
-    if (s == "ngg")  return PamFilter::NGG_ONLY;
-    if (s == "nag")  return PamFilter::NAG_ONLY;
-    if (s == "both") return PamFilter::NGG_OR_NAG;
-    return PamFilter::ANY;
+static PamSpec build_pam_spec(const Arguments& args) {
+    PamSpec spec;
+    spec.pattern = args.pam_pattern;
+    spec.position = (args.pam_position == "5prime")
+                    ? PamPosition::FIVE_PRIME
+                    : PamPosition::THREE_PRIME;
+    spec.extract_length = args.pam_extract_length;
+    return spec;
 }
 
 static DistanceMode distance_mode_from_string(const std::string& s) {
@@ -521,7 +583,6 @@ static std::string run_batch_search(const Arguments& args, GenomeView view,
     batch_config.prefer_gpu = !args.cpu_only;
     batch_config.compute_mismatches = args.compute_mismatches;
     batch_config.compute_scores = args.compute_scores;
-    batch_config.compute_mit_score = args.compute_mit_score;
     batch_config.max_hits_per_spacer = args.max_hits;
     batch_config.forward_only = forward_only_for(args.strand_mode);
     batch_config.reverse_only = reverse_only_for(args.strand_mode);
@@ -530,7 +591,7 @@ static std::string run_batch_search(const Arguments& args, GenomeView view,
     batch_config.search_start = region_start;
     batch_config.search_end   = region_end;
     batch_config.distance_mode = distance_mode_from_string(args.distance_mode);
-    batch_config.pam_filter = pam_filter_from_string(args.pam_filter);
+    batch_config.pam = build_pam_spec(args);
 
     BatchSearchResult batch_result = search_genome_batch(batch_config, view);
 
@@ -557,23 +618,69 @@ static std::string run_batch_search(const Arguments& args, GenomeView view,
     }
 
     if (args.verbose) {
-        std::cerr << "Batch search completed in " << batch_result.total_time_ms << " ms\n";
-        std::cerr << "Used GPU: " << (batch_result.used_gpu ? "yes" : "no") << "\n";
+        double kernel_ms = batch_result.total_time_ms - batch_result.scoring_time_ms;
+        std::cerr << "Search (kernel):  " << static_cast<long>(kernel_ms)  << " ms"
+                  << "  [GPU: " << (batch_result.used_gpu ? "yes" : "no") << "]\n";
+        std::cerr << "Scoring (CFD):    " << static_cast<long>(batch_result.scoring_time_ms) << " ms\n";
         std::cerr << "Total hits: " << batch_result.total_hits << "\n";
     } else if (!args.quiet) {
         std::cerr << "Total hits: " << batch_result.total_hits << "\n";
     }
 
+    // Write per-spacer summary if requested
+    if (!args.spacer_summary_path.empty()) {
+        // Load each named BED forest; keep alive for the duration of summarization.
+        std::vector<std::unique_ptr<annot::BedForest>> forests;
+        std::vector<spacer::AnnotationBed> annotations;
+        std::vector<std::string> annotation_labels;
+        for (const auto& [label, path] : args.intersect_beds) {
+            forests.push_back(std::make_unique<annot::BedForest>(annot::load_bed(path)));
+            annotations.push_back({label, forests.back().get()});
+            annotation_labels.push_back(label);
+        }
+
+        spacer::SpacerSummaryConfig sum_config;
+        sum_config.acfd_threshold = args.acfd_threshold;
+
+        std::vector<spacer::SpacerSummaryRow> rows;
+        rows.reserve(batch_result.spacer_results.size());
+        for (const auto& sr : batch_result.spacer_results) {
+            rows.push_back(spacer::compute_spacer_summary(
+                sr.spacer_name, sr.spacer_sequence, sr.result.hits,
+                sum_config, annotations));
+        }
+
+        std::ofstream sum_out(args.spacer_summary_path);
+        if (!sum_out) {
+            std::cerr << "Error: Could not open spacer summary file: "
+                      << args.spacer_summary_path << "\n";
+        } else {
+            sum_out << spacer::format_spacer_summary_tsv(rows, annotation_labels);
+            if (args.verbose)
+                std::cerr << "Spacer summary written to: "
+                          << args.spacer_summary_path << "\n";
+        }
+    }
+
+    auto fmt_t0 = std::chrono::high_resolution_clock::now();
+    std::string formatted;
     if (args.summary_mode) {
         auto summary = summarize_batch_results(
             batch_result, static_cast<uint8_t>(args.threshold));
-        return (args.summary_format == "tsv")
+        formatted = (args.summary_format == "tsv")
             ? format_summary_tsv(summary)
             : format_summary_json(summary);
+    } else if (args.format == "tsv")  { formatted = format_batch_hits_tsv(batch_result); }
+    else if (args.format == "json")   { formatted = format_batch_hits_json(batch_result); }
+    else                              { formatted = format_batch_hits_bed(batch_result); }
+
+    if (args.verbose) {
+        auto fmt_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::high_resolution_clock::now() - fmt_t0).count();
+        std::cerr << "Format (TSV):     " << fmt_ms << " ms"
+                  << "  [" << (formatted.size() / 1024 / 1024) << " MB]\n";
     }
-    if (args.format == "tsv")  return format_batch_hits_tsv(batch_result);
-    if (args.format == "json") return format_batch_hits_json(batch_result);
-    return format_batch_hits_bed(batch_result);
+    return formatted;
 }
 
 static std::string run_single_search(const Arguments& args, GenomeView view,
@@ -591,7 +698,7 @@ static std::string run_single_search(const Arguments& args, GenomeView view,
     config.search_start = region_start;
     config.search_end   = region_end;
     config.distance_mode = distance_mode_from_string(args.distance_mode);
-    config.pam_filter = pam_filter_from_string(args.pam_filter);
+    config.pam = build_pam_spec(args);
 
     if (args.verbose) {
         const char* strand_str = (args.strand_mode == StrandMode::BOTH)  ? "both"
@@ -603,7 +710,12 @@ static std::string run_single_search(const Arguments& args, GenomeView view,
         std::cerr << "Strand: " << strand_str << "\n";
         std::cerr << "Compute mismatches: " << (config.compute_mismatches ? "yes" : "no") << "\n";
         std::cerr << "Compute CFD scores: " << (config.compute_scores ? "yes" : "no") << "\n";
-        std::cerr << "PAM filter: " << args.pam_filter << "\n";
+        if (args.pam_pattern.empty()) {
+            std::cerr << "PAM filter: (none)\n";
+        } else {
+            std::cerr << "PAM filter: " << args.pam_pattern
+                      << " (" << args.pam_position << ")\n";
+        }
         if (config.max_hits > 0) {
             std::cerr << "Max hits: " << config.max_hits << "\n";
         }
@@ -616,24 +728,65 @@ static std::string run_single_search(const Arguments& args, GenomeView view,
     auto search_end = std::chrono::high_resolution_clock::now();
 
     if (args.verbose) {
-        auto search_ms = std::chrono::duration_cast<std::chrono::milliseconds>(search_end - search_start).count();
-        std::cerr << "Search completed in " << search_ms << " ms\n";
-        std::cerr << "Used GPU: " << (result.used_gpu ? "yes" : "no") << "\n";
+        auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(search_end - search_start).count();
+        long kernel_ms = total_ms - static_cast<long>(result.scoring_time_ms);
+        std::cerr << "Search (kernel):  " << kernel_ms << " ms"
+                  << "  [GPU: " << (result.used_gpu ? "yes" : "no") << "]\n";
+        std::cerr << "Scoring (CFD):    " << static_cast<long>(result.scoring_time_ms) << " ms\n";
         std::cerr << "Positions scanned: " << result.total_positions << "\n";
         std::cerr << "Hits found: " << result.hits.size() << "\n";
     } else if (!args.quiet) {
         std::cerr << "Hits found: " << result.hits.size() << "\n";
     }
 
+    // Write per-spacer summary if requested
+    if (!args.spacer_summary_path.empty()) {
+        std::vector<std::unique_ptr<annot::BedForest>> forests;
+        std::vector<spacer::AnnotationBed> annotations;
+        std::vector<std::string> annotation_labels;
+        for (const auto& [label, path] : args.intersect_beds) {
+            forests.push_back(std::make_unique<annot::BedForest>(annot::load_bed(path)));
+            annotations.push_back({label, forests.back().get()});
+            annotation_labels.push_back(label);
+        }
+
+        spacer::SpacerSummaryConfig sum_config;
+        sum_config.acfd_threshold = args.acfd_threshold;
+
+        std::vector<spacer::SpacerSummaryRow> rows;
+        rows.push_back(spacer::compute_spacer_summary(
+            config.pattern, config.pattern, result.hits, sum_config, annotations));
+
+        std::ofstream sum_out(args.spacer_summary_path);
+        if (!sum_out) {
+            std::cerr << "Error: Could not open spacer summary file: "
+                      << args.spacer_summary_path << "\n";
+        } else {
+            sum_out << spacer::format_spacer_summary_tsv(rows, annotation_labels);
+            if (args.verbose)
+                std::cerr << "Spacer summary written to: "
+                          << args.spacer_summary_path << "\n";
+        }
+    }
+
+    auto fmt_t0 = std::chrono::high_resolution_clock::now();
+    std::string formatted;
     if (args.summary_mode) {
         auto summary = summarize_single_result(result, args.pattern);
-        return (args.summary_format == "tsv")
+        formatted = (args.summary_format == "tsv")
             ? format_summary_tsv(summary)
             : format_summary_json(summary);
+    } else if (args.format == "tsv")  { formatted = format_hits_tsv(result.hits, config.pattern); }
+    else if (args.format == "json")   { formatted = format_hits_json(result.hits, config.pattern); }
+    else                              { formatted = format_hits_bed(result.hits, config.pattern); }
+
+    if (args.verbose) {
+        auto fmt_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::high_resolution_clock::now() - fmt_t0).count();
+        std::cerr << "Format (TSV):     " << fmt_ms << " ms"
+                  << "  [" << (formatted.size() / 1024 / 1024) << " MB]\n";
     }
-    if (args.format == "tsv")  return format_hits_tsv(result.hits, config.pattern);
-    if (args.format == "json") return format_hits_json(result.hits, config.pattern);
-    return format_hits_bed(result.hits, config.pattern);
+    return formatted;
 }
 
 // Open the genome (auto-detect .cy for memory-mapped loading).
@@ -710,6 +863,7 @@ int main(int argc, char** argv) {
             ? run_single_search(args, view, region_start, region_end)
             : run_batch_search(args, view, region_start, region_end);
 
+        auto write_t0 = std::chrono::high_resolution_clock::now();
         if (args.output_path.empty()) {
             std::cout << output;
         } else {
@@ -719,15 +873,15 @@ int main(int argc, char** argv) {
                 return 1;
             }
             outfile << output;
-            if (args.verbose) {
-                std::cerr << "Results written to: " << args.output_path << "\n";
-            }
         }
 
         if (args.verbose) {
             auto end_time = std::chrono::high_resolution_clock::now();
+            auto write_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - write_t0).count();
             auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
-            std::cerr << "Total time: " << total_ms << " ms\n";
+            std::cerr << "Write (output):   " << write_ms << " ms"
+                      << (args.output_path.empty() ? "  [stdout]" : ("  [" + args.output_path + "]")) << "\n";
+            std::cerr << "Total:            " << total_ms << " ms\n";
         }
 
         return 0;

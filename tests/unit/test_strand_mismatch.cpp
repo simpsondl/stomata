@@ -149,7 +149,6 @@ TEST_CASE("Strand enum - character values", "[search_pipeline][strand]") {
 
 TEST_CASE("SearchConfig - strand and mismatch defaults", "[search_pipeline][config]") {
     SearchConfig config;
-    config.pam_filter = PamFilter::NONE;  // Disable PAM filtering for synthetic test data
     REQUIRE(config.search_both_strands == true);
     REQUIRE(config.compute_mismatches == true);
 }
@@ -179,7 +178,6 @@ TEST_CASE("search_genome - finds hits on forward strand", "[search_pipeline][str
     Genome genome = load_fasta(kTestSmallFa);
 
     SearchConfig config;
-    config.pam_filter = PamFilter::NONE;  // Disable PAM filtering for synthetic test data
     config.pattern = "ACGT";
     config.threshold = 0;
     config.prefer_gpu = false;
@@ -200,7 +198,6 @@ TEST_CASE("search_genome - finds hits on both strands", "[search_pipeline][stran
     Genome genome = load_fasta(kTestSmallFa);
 
     SearchConfig config;
-    config.pam_filter = PamFilter::NONE;  // Disable PAM filtering for synthetic test data
     config.pattern = "ACGT";  // RC(ACGT) = ACGT (palindrome)
     config.threshold = 0;
     config.prefer_gpu = false;
@@ -229,7 +226,6 @@ TEST_CASE("search_genome - asymmetric pattern finds different positions per stra
     Genome genome = encode_genome(entries);
 
     SearchConfig config;
-    config.pam_filter = PamFilter::NONE;  // Disable PAM filtering for synthetic test data
     config.pattern = "AAAC";  // RC = GTTT
     config.threshold = 0;
     config.prefer_gpu = false;
@@ -259,7 +255,6 @@ TEST_CASE("search_genome - mismatch info populated for hits", "[search_pipeline]
     Genome genome = load_fasta(kTestSmallFa);
 
     SearchConfig config;
-    config.pam_filter = PamFilter::NONE;  // Disable PAM filtering for synthetic test data
     config.pattern = "ACGT";
     config.threshold = 0;
     config.prefer_gpu = false;
@@ -269,12 +264,11 @@ TEST_CASE("search_genome - mismatch info populated for hits", "[search_pipeline]
 
     REQUIRE(result.hits.size() > 0);
 
-    // For exact matches, mismatch_positions should be empty
+    // For exact matches, CIGAR should be all-M and contain no indels.
     for (const auto& hit : result.hits) {
         if (hit.distance == 0) {
-            REQUIRE(hit.mismatch_info.mismatch_positions.empty());
-            REQUIRE(hit.mismatch_info.total_distal_edits() == 0);
-            REQUIRE(hit.mismatch_info.total_seed_edits() == 0);
+            REQUIRE(!cigar_has_indel(hit.mismatch_info.cigar));
+            REQUIRE(hit.mismatch_info.aligned_sequence == "ACGT");
         }
     }
 }
@@ -288,11 +282,11 @@ TEST_CASE("search_genome - mismatch positions computed correctly", "[search_pipe
     Genome genome = encode_genome(entries);
 
     SearchConfig config;
-    config.pam_filter = PamFilter::NONE;  // Disable PAM filtering for synthetic test data
     config.pattern = "ACGTACGTACGTACGTACGT";  // 20bp pattern
     config.threshold = 0;
     config.prefer_gpu = false;
     config.compute_mismatches = true;
+    config.pam.extract_length = 3;  // annotate 3'-PAM (no filter)
 
     SearchResult result = search_genome(config, genome);
 
@@ -305,15 +299,15 @@ TEST_CASE("search_genome - mismatch positions computed correctly", "[search_pipe
         if (hit.genome_pos == 19 && hit.strand == Strand::PLUS) {
             found = true;
             REQUIRE(hit.distance == 0);
-            REQUIRE(hit.mismatch_info.mismatch_positions.empty());
+            REQUIRE(!cigar_has_indel(hit.mismatch_info.cigar));
+            REQUIRE(hit.mismatch_info.aligned_sequence == "ACGTACGTACGTACGTACGT");
             REQUIRE(hit.mismatch_info.pam_sequence == "NGG");
-            REQUIRE(hit.mismatch_info.pam_type == PamType::NGG);  // NGG is valid
         }
     }
     REQUIRE(found);
 }
 
-TEST_CASE("search_genome - detects seed region mismatch", "[search_pipeline][mismatch]") {
+TEST_CASE("search_genome - detects mismatch in pattern region", "[search_pipeline][mismatch]") {
     // 20bp spacer with mismatch at position 15 (in seed region: positions 13-20)
     std::vector<FastaEntry> entries = {{
         "test_chr",
@@ -327,7 +321,6 @@ TEST_CASE("search_genome - detects seed region mismatch", "[search_pipeline][mis
     Genome genome = encode_genome(entries);
 
     SearchConfig config;
-    config.pam_filter = PamFilter::NONE;  // Disable PAM filtering for synthetic test data
     config.pattern = "ACGTACGTACGTACGTACGT";  // 20bp pattern
     config.threshold = 1;  // Allow 1 mismatch
     config.prefer_gpu = false;
@@ -340,17 +333,15 @@ TEST_CASE("search_genome - detects seed region mismatch", "[search_pipeline][mis
     for (const auto& hit : result.hits) {
         if (hit.strand == Strand::PLUS && hit.distance == 1) {
             found = true;
-            // Position 15 is in seed region (positions 13-20 for 20bp pattern)
-            REQUIRE(hit.mismatch_info.total_seed_edits() > 0);
-            REQUIRE(hit.mismatch_info.total_distal_edits() == 0);
-            REQUIRE(hit.mismatch_info.mismatch_positions.size() == 1);
-            REQUIRE(hit.mismatch_info.mismatch_positions[0] == 15);
+            // Aligned sequence should reflect the genome bases (with the mismatch).
+            REQUIRE(hit.mismatch_info.aligned_sequence == "ACGTACGTACGTACATACGT");
+            REQUIRE(!cigar_has_indel(hit.mismatch_info.cigar));
         }
     }
     REQUIRE(found);
 }
 
-TEST_CASE("search_genome - detects distal region mismatch", "[search_pipeline][mismatch]") {
+TEST_CASE("search_genome - detects mismatch near pattern start", "[search_pipeline][mismatch]") {
     // 20bp spacer with mismatch at position 3 (in distal region: positions 1-12)
     // Pattern: ACGTACGTACGTACGTACGT
     // Genome:  ACATACGTACGTACGTACGT + NGG (mismatch at position 3: G->A)
@@ -361,7 +352,6 @@ TEST_CASE("search_genome - detects distal region mismatch", "[search_pipeline][m
     Genome genome = encode_genome(entries);
 
     SearchConfig config;
-    config.pam_filter = PamFilter::NONE;  // Disable PAM filtering for synthetic test data
     config.pattern = "ACGTACGTACGTACGTACGT";  // 20bp pattern
     config.threshold = 1;  // Allow 1 mismatch
     config.prefer_gpu = false;
@@ -373,11 +363,8 @@ TEST_CASE("search_genome - detects distal region mismatch", "[search_pipeline][m
     for (const auto& hit : result.hits) {
         if (hit.strand == Strand::PLUS && hit.distance == 1) {
             found = true;
-            // Position 3 is in distal region (positions 1-12 for 20bp pattern)
-            REQUIRE(hit.mismatch_info.total_distal_edits() > 0);
-            REQUIRE(hit.mismatch_info.total_seed_edits() == 0);
-            REQUIRE(hit.mismatch_info.mismatch_positions.size() == 1);
-            REQUIRE(hit.mismatch_info.mismatch_positions[0] == 3);
+            REQUIRE(hit.mismatch_info.aligned_sequence == "ACATACGTACGTACGTACGT");
+            REQUIRE(!cigar_has_indel(hit.mismatch_info.cigar));
         }
     }
     REQUIRE(found);
@@ -395,11 +382,11 @@ TEST_CASE("search_genome - valid NGG PAM", "[search_pipeline][pam]") {
     Genome genome = encode_genome(entries);
 
     SearchConfig config;
-    config.pam_filter = PamFilter::NONE;  // Disable PAM filtering for synthetic test data
     config.pattern = "ACGTACGTACGTACGTACGT";
     config.threshold = 0;
     config.prefer_gpu = false;
     config.compute_mismatches = true;
+    config.pam.extract_length = 3;
 
     SearchResult result = search_genome(config, genome);
 
@@ -408,7 +395,6 @@ TEST_CASE("search_genome - valid NGG PAM", "[search_pipeline][pam]") {
         if (hit.strand == Strand::PLUS && hit.genome_pos == 19) {
             found = true;
             REQUIRE(hit.mismatch_info.pam_sequence == "AGG");
-            REQUIRE(hit.mismatch_info.pam_type == PamType::NGG);  // Valid PAM
         }
     }
     REQUIRE(found);
@@ -422,11 +408,11 @@ TEST_CASE("search_genome - valid NAG PAM", "[search_pipeline][pam]") {
     Genome genome = encode_genome(entries);
 
     SearchConfig config;
-    config.pam_filter = PamFilter::NONE;  // Disable PAM filtering for synthetic test data
     config.pattern = "ACGTACGTACGTACGTACGT";
     config.threshold = 0;
     config.prefer_gpu = false;
     config.compute_mismatches = true;
+    config.pam.extract_length = 3;
 
     SearchResult result = search_genome(config, genome);
 
@@ -435,13 +421,12 @@ TEST_CASE("search_genome - valid NAG PAM", "[search_pipeline][pam]") {
         if (hit.strand == Strand::PLUS && hit.genome_pos == 19) {
             found = true;
             REQUIRE(hit.mismatch_info.pam_sequence == "CAG");
-            REQUIRE(hit.mismatch_info.pam_type == PamType::NAG);  // Valid PAM
         }
     }
     REQUIRE(found);
 }
 
-TEST_CASE("search_genome - invalid PAM flagged", "[search_pipeline][pam]") {
+TEST_CASE("search_genome - non-NGG PAM extracted", "[search_pipeline][pam]") {
     std::vector<FastaEntry> entries = {{
         "test_chr",
         "ACGTACGTACGTACGTACGTATG"  // 20bp + ATG (invalid PAM)
@@ -449,11 +434,11 @@ TEST_CASE("search_genome - invalid PAM flagged", "[search_pipeline][pam]") {
     Genome genome = encode_genome(entries);
 
     SearchConfig config;
-    config.pam_filter = PamFilter::NONE;  // Disable PAM filtering for synthetic test data
     config.pattern = "ACGTACGTACGTACGTACGT";
     config.threshold = 0;
     config.prefer_gpu = false;
     config.compute_mismatches = true;
+    config.pam.extract_length = 3;
 
     SearchResult result = search_genome(config, genome);
 
@@ -462,17 +447,15 @@ TEST_CASE("search_genome - invalid PAM flagged", "[search_pipeline][pam]") {
         if (hit.strand == Strand::PLUS && hit.genome_pos == 19) {
             found = true;
             REQUIRE(hit.mismatch_info.pam_sequence == "ATG");
-            REQUIRE(hit.mismatch_info.pam_type == PamType::OTHER);  // Invalid PAM
         }
     }
     REQUIRE(found);
 }
 
-TEST_CASE("search_genome - various invalid PAMs", "[search_pipeline][pam]") {
-    // Test multiple invalid PAM sequences
-    std::vector<std::string> invalid_pams = {"AAA", "TTT", "CCC", "ACG", "TGA", "GAC"};
+TEST_CASE("search_genome - various PAM sequences extracted verbatim", "[search_pipeline][pam]") {
+    std::vector<std::string> pams = {"AAA", "TTT", "CCC", "ACG", "TGA", "GAC"};
 
-    for (const auto& pam : invalid_pams) {
+    for (const auto& pam : pams) {
         std::vector<FastaEntry> entries = {{
             "test_chr",
             "ACGTACGTACGTACGTACGT" + pam
@@ -480,18 +463,17 @@ TEST_CASE("search_genome - various invalid PAMs", "[search_pipeline][pam]") {
         Genome genome = encode_genome(entries);
 
         SearchConfig config;
-    config.pam_filter = PamFilter::NONE;  // Disable PAM filtering for synthetic test data
         config.pattern = "ACGTACGTACGTACGTACGT";
         config.threshold = 0;
         config.prefer_gpu = false;
         config.compute_mismatches = true;
+        config.pam.extract_length = 3;
 
         SearchResult result = search_genome(config, genome);
 
         for (const auto& hit : result.hits) {
             if (hit.strand == Strand::PLUS && hit.genome_pos == 19) {
                 REQUIRE(hit.mismatch_info.pam_sequence == pam);
-                REQUIRE(hit.mismatch_info.pam_type == PamType::OTHER);  // All should be invalid
             }
         }
     }
@@ -501,7 +483,7 @@ TEST_CASE("search_genome - various invalid PAMs", "[search_pipeline][pam]") {
 // Output format tests
 // ───────────────────────────────────────────────────────────────────────────
 
-TEST_CASE("format_hits_tsv - includes new columns", "[search_pipeline][format]") {
+TEST_CASE("format_hits_tsv - includes expected columns", "[search_pipeline][format]") {
     std::vector<SearchHit> hits;
 
     SearchHit hit;
@@ -512,30 +494,21 @@ TEST_CASE("format_hits_tsv - includes new columns", "[search_pipeline][format]")
     hit.strand = Strand::PLUS;
     hit.mismatch_info.aligned_sequence = "ACGTACGTACGTACGTACGT";
     hit.mismatch_info.pam_sequence = "AGG";
-    hit.mismatch_info.pam_type = PamType::NGG;
-    hit.mismatch_info.mismatch_positions = {5};
-    hit.mismatch_info.edit_types = {EditType::MISMATCH};
-    hit.mismatch_info.distal_mismatches = 1;
-    hit.mismatch_info.seed_mismatches = 0;
+    hit.mismatch_info.cigar = "20M";
 
     hits.push_back(hit);
 
     std::string tsv = format_hits_tsv(hits, "ACGTACGTACGTACGTACGT");
 
-    // Check header - updated column names from annotation refactoring
+    // Header columns (new layout).
     REQUIRE(tsv.find("chrom\tstart\tend\tpattern\tdistance\tstrand\t") != std::string::npos);
-    REQUIRE(tsv.find("aligned_seq\tmismatch_pos\tedit_types\t") != std::string::npos);
-    REQUIRE(tsv.find("pam_seq\tpam_type\t") != std::string::npos);
-    REQUIRE(tsv.find("seed_edits\tdistal_edits\t") != std::string::npos);
-    REQUIRE(tsv.find("alignment_ambiguous") != std::string::npos);
+    REQUIRE(tsv.find("aligned_seq\tcigar\tpam_seq\t") != std::string::npos);
+    REQUIRE(tsv.find("alignment_ambiguous\tn_ambiguous_cells\t") != std::string::npos);
+    REQUIRE(tsv.find("cfd_score") != std::string::npos);
 
-    // Check data contains strand
-    REQUIRE(tsv.find("+") != std::string::npos);
-
-    // Check data contains mismatch position
-    REQUIRE(tsv.find("5") != std::string::npos);
-
-    // Check PAM
+    // Data row contains strand, CIGAR, and PAM.
+    REQUIRE(tsv.find("\t+\t") != std::string::npos);
+    REQUIRE(tsv.find("20M") != std::string::npos);
     REQUIRE(tsv.find("AGG") != std::string::npos);
 }
 
@@ -587,7 +560,6 @@ TEST_CASE("search_genome - multiple mismatches in both regions", "[search_pipeli
     Genome genome = encode_genome(entries);
 
     SearchConfig config;
-    config.pam_filter = PamFilter::NONE;  // Disable PAM filtering for synthetic test data
     config.pattern = "ACGTACGTACGTACGTACGT";
     config.threshold = 3;  // Allow 3 mismatches
     config.prefer_gpu = false;
@@ -599,10 +571,9 @@ TEST_CASE("search_genome - multiple mismatches in both regions", "[search_pipeli
     for (const auto& hit : result.hits) {
         if (hit.strand == Strand::PLUS && hit.distance == 3) {
             found = true;
-            // Should have both distal and seed edits
-            REQUIRE(hit.mismatch_info.total_distal_edits() > 0);
-            REQUIRE(hit.mismatch_info.total_seed_edits() > 0);
-            REQUIRE(hit.mismatch_info.mismatch_positions.size() == 3);
+            // Aligned sequence should reflect all three mismatches.
+            REQUIRE(hit.mismatch_info.aligned_sequence == "ACATACATACGTACATACGT");
+            REQUIRE(!cigar_has_indel(hit.mismatch_info.cigar));
         }
     }
     REQUIRE(found);
@@ -617,11 +588,11 @@ TEST_CASE("search_genome - PAM at genome boundary", "[search_pipeline][pam]") {
     Genome genome = encode_genome(entries);
 
     SearchConfig config;
-    config.pam_filter = PamFilter::NONE;  // Disable PAM filtering for synthetic test data
     config.pattern = "ACGTACGTACGTACGTACGT";
     config.threshold = 0;
     config.prefer_gpu = false;
     config.compute_mismatches = true;
+    config.pam.extract_length = 3;
 
     SearchResult result = search_genome(config, genome);
 
@@ -645,11 +616,11 @@ TEST_CASE("search_genome - PAM beyond genome returns empty", "[search_pipeline][
     Genome genome = encode_genome(entries);
 
     SearchConfig config;
-    config.pam_filter = PamFilter::NONE;  // Disable PAM filtering for synthetic test data
     config.pattern = "ACGTACGTACGTACGTACGT";
     config.threshold = 0;
     config.prefer_gpu = false;
     config.compute_mismatches = true;
+    config.pam.extract_length = 3;
 
     SearchResult result = search_genome(config, genome);
 
@@ -676,7 +647,6 @@ TEST_CASE("search_genome - minus strand mismatch info", "[search_pipeline][misma
     Genome genome = encode_genome(entries);
 
     SearchConfig config;
-    config.pam_filter = PamFilter::NONE;  // Disable PAM filtering for synthetic test data
     config.pattern = "AAAACCCCGGGGTTTTAAAA";
     config.threshold = 1;
     config.prefer_gpu = false;
@@ -692,17 +662,19 @@ TEST_CASE("search_genome - minus strand mismatch info", "[search_pipeline][misma
             found = true;
             // Verify mismatch info is populated for minus strand
             REQUIRE(!hit.mismatch_info.aligned_sequence.empty());
-            REQUIRE(!hit.mismatch_info.mismatch_positions.empty());
+            REQUIRE(!hit.mismatch_info.cigar.empty());
         }
     }
     REQUIRE(found);
 }
 
-TEST_CASE("search_genome - all valid PAM types", "[search_pipeline][pam]") {
-    // Test all NGG variations: AGG, CGG, GGG, TGG
-    std::vector<std::string> ngg_pams = {"AGG", "CGG", "GGG", "TGG"};
+TEST_CASE("search_genome - assorted PAMs are extracted verbatim", "[search_pipeline][pam]") {
+    std::vector<std::string> pams = {
+        "AGG", "CGG", "GGG", "TGG",
+        "AAG", "CAG", "GAG", "TAG",
+    };
 
-    for (const auto& pam : ngg_pams) {
+    for (const auto& pam : pams) {
         std::vector<FastaEntry> entries = {{
             "test_chr",
             "ACGTACGTACGTACGTACGT" + pam
@@ -710,75 +682,23 @@ TEST_CASE("search_genome - all valid PAM types", "[search_pipeline][pam]") {
         Genome genome = encode_genome(entries);
 
         SearchConfig config;
-    config.pam_filter = PamFilter::NONE;  // Disable PAM filtering for synthetic test data
         config.pattern = "ACGTACGTACGTACGTACGT";
         config.threshold = 0;
         config.prefer_gpu = false;
         config.compute_mismatches = true;
+        config.pam.extract_length = 3;
 
         SearchResult result = search_genome(config, genome);
 
         for (const auto& hit : result.hits) {
             if (hit.strand == Strand::PLUS && hit.genome_pos == 19) {
                 REQUIRE(hit.mismatch_info.pam_sequence == pam);
-                REQUIRE(hit.mismatch_info.pam_type == PamType::NGG);  // All NGG should be valid
-            }
-        }
-    }
-
-    // Test all NAG variations: AAG, CAG, GAG, TAG
-    std::vector<std::string> nag_pams = {"AAG", "CAG", "GAG", "TAG"};
-
-    for (const auto& pam : nag_pams) {
-        std::vector<FastaEntry> entries = {{
-            "test_chr",
-            "ACGTACGTACGTACGTACGT" + pam
-        }};
-        Genome genome = encode_genome(entries);
-
-        SearchConfig config;
-    config.pam_filter = PamFilter::NONE;  // Disable PAM filtering for synthetic test data
-        config.pattern = "ACGTACGTACGTACGTACGT";
-        config.threshold = 0;
-        config.prefer_gpu = false;
-        config.compute_mismatches = true;
-
-        SearchResult result = search_genome(config, genome);
-
-        for (const auto& hit : result.hits) {
-            if (hit.strand == Strand::PLUS && hit.genome_pos == 19) {
-                REQUIRE(hit.mismatch_info.pam_sequence == pam);
-                REQUIRE(hit.mismatch_info.pam_type == PamType::NAG);  // All NAG should be valid
             }
         }
     }
 }
 
-TEST_CASE("format_hits_tsv - comma-separated mismatch positions", "[search_pipeline][format]") {
-    std::vector<SearchHit> hits;
-
-    SearchHit hit;
-    hit.genome_pos = 99;
-    hit.distance = 3;
-    hit.chrom_name = "chr1";
-    hit.chrom_offset = 99;
-    hit.strand = Strand::PLUS;
-    hit.mismatch_info.aligned_sequence = "ACGTACGTACGTACGTACGT";
-    hit.mismatch_info.pam_sequence = "AGG";
-    hit.mismatch_info.pam_type = PamType::NGG;
-    hit.mismatch_info.mismatch_positions = {3, 7, 15};
-    hit.mismatch_info.distal_mismatches = 2;  // positions 3 and 7
-    hit.mismatch_info.seed_mismatches = 1;    // position 15
-
-    hits.push_back(hit);
-
-    std::string tsv = format_hits_tsv(hits, "ACGTACGTACGTACGTACGT");
-
-    // Check that mismatch positions are comma-separated
-    REQUIRE(tsv.find("3,7,15") != std::string::npos);
-}
-
-TEST_CASE("format_hits_tsv - empty mismatch positions shown as dot", "[search_pipeline][format]") {
+TEST_CASE("format_hits_tsv - exact match shows full-M CIGAR", "[search_pipeline][format]") {
     std::vector<SearchHit> hits;
 
     SearchHit hit;
@@ -789,15 +709,13 @@ TEST_CASE("format_hits_tsv - empty mismatch positions shown as dot", "[search_pi
     hit.strand = Strand::PLUS;
     hit.mismatch_info.aligned_sequence = "ACGTACGTACGTACGTACGT";
     hit.mismatch_info.pam_sequence = "AGG";
-    hit.mismatch_info.pam_type = PamType::NGG;
-    hit.mismatch_info.mismatch_positions = {};  // Empty for exact match
-    // All counters default to 0, no need to set
+    hit.mismatch_info.cigar = "20M";
 
     hits.push_back(hit);
 
     std::string tsv = format_hits_tsv(hits, "ACGTACGTACGTACGTACGT");
 
-    // Find the line and check for "." in mismatch position column
-    // The format should have the mismatch column show "." for empty
-    REQUIRE(tsv.find("\t.\t") != std::string::npos);
+    // For an exact match the CIGAR column should hold "20M".
+    REQUIRE(tsv.find("\t20M\t") != std::string::npos);
+    REQUIRE(tsv.find("AGG") != std::string::npos);
 }

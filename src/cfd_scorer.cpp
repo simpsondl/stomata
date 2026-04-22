@@ -312,67 +312,14 @@ double compute_cfd_score(const std::string& pattern,
 
 double compute_cfd_score(const std::string& pattern,
                          const MismatchInfo& mismatch_info) {
-    // CFD model only handles mismatches, not bulges (indels)
-    // If there are any bulges, CFD is not applicable
-    if (mismatch_info.has_dna_bulge() || mismatch_info.has_rna_bulge()) {
-        return 0.0;  // CFD undefined for indels
+    // CFD model only handles mismatches, not bulges (indels).
+    if (cigar_has_indel(mismatch_info.cigar)) {
+        return 0.0;
     }
 
-    // Use aligned sequence for comparison
     return compute_cfd_score(pattern,
                              mismatch_info.aligned_sequence,
                              mismatch_info.pam_sequence);
-}
-
-uint8_t classify_risk_tier(double cfd_score) {
-    if (cfd_score >= CFD_HIGH_RISK_THRESHOLD) {
-        return 2;  // High risk
-    } else if (cfd_score >= CFD_MEDIUM_RISK_THRESHOLD) {
-        return 1;  // Medium risk
-    } else {
-        return 0;  // Low risk
-    }
-}
-
-bool is_predicted_active(double cfd_score, double threshold) {
-    return cfd_score >= threshold;
-}
-
-// MIT Specificity Score implementation
-
-double compute_mit_specificity_score(
-    const std::vector<double>& cfd_scores,
-    bool include_perfect_matches) {
-    
-    // Empty input = perfect specificity
-    if (cfd_scores.empty()) {
-        return 100.0;
-    }
-
-    // Sum up all CFD scores (optionally excluding perfect matches)
-    double sum = 0.0;
-    for (double cfd : cfd_scores) {
-        // Skip perfect matches if requested
-        if (!include_perfect_matches && cfd >= 0.9999) {
-            continue;
-        }
-        sum += cfd;
-    }
-
-    // MIT formula: 100 / (100 + sum(CFD))
-    return 100.0 / (100.0 + sum);
-}
-
-uint8_t classify_specificity_tier(double mit_score) {
-    if (mit_score >= MIT_EXCELLENT_THRESHOLD) {
-        return 3;  // Excellent specificity
-    } else if (mit_score >= MIT_GOOD_THRESHOLD) {
-        return 2;  // Good specificity
-    } else if (mit_score >= MIT_FAIR_THRESHOLD) {
-        return 1;  // Fair specificity
-    } else {
-        return 0;  // Poor specificity
-    }
 }
 
 } // namespace cfd

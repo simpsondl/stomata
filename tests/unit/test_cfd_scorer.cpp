@@ -201,71 +201,30 @@ TEST_CASE("CFD score from MismatchInfo - perfect match", "[cfd][mismatch_info]")
     REQUIRE_THAT(score, WithinAbs(1.0, 0.001));
 }
 
-TEST_CASE("CFD score from MismatchInfo - with bulge returns 0.0", "[cfd][mismatch_info]") {
+TEST_CASE("CFD score from MismatchInfo - DNA bulge (insertion) returns 0.0", "[cfd][mismatch_info]") {
     std::string pattern = "ACGTACGTACGTACGTACGT";
 
     MismatchInfo info;
     info.aligned_sequence = "ACGTACGTACGTACGTACGT";
     info.pam_sequence = "AGG";
-    info.pam_type = PamType::NGG;
-    info.seed_dna_bulges = 1;  // Has a DNA bulge
+    info.cigar = "10M1I9M";  // Insertion = DNA bulge in aligner terms
 
     double score = cfd::compute_cfd_score(pattern, info);
 
-    // CFD is undefined for bulges, should return 0
+    // CFD is undefined for indels, should return 0
     REQUIRE(score == 0.0);
 }
 
-TEST_CASE("CFD score from MismatchInfo - RNA bulge returns 0.0", "[cfd][mismatch_info]") {
+TEST_CASE("CFD score from MismatchInfo - RNA bulge (deletion) returns 0.0", "[cfd][mismatch_info]") {
     std::string pattern = "ACGTACGTACGTACGTACGT";
 
     MismatchInfo info;
     info.aligned_sequence = "ACGTACGTACGTACGTACGT";
     info.pam_sequence = "AGG";
-    info.pam_type = PamType::NGG;
-    info.distal_rna_bulges = 1;  // Has an RNA bulge
+    info.cigar = "5M1D14M";  // Deletion = RNA bulge
 
     double score = cfd::compute_cfd_score(pattern, info);
     REQUIRE(score == 0.0);
-}
-
-// ───────────────────────────────────────────────────────────────────────────
-// Risk tier classification tests
-// ───────────────────────────────────────────────────────────────────────────
-
-TEST_CASE("CFD risk tier - high risk (>= 0.1)", "[cfd][risk]") {
-    REQUIRE(cfd::classify_risk_tier(0.1) == 2);
-    REQUIRE(cfd::classify_risk_tier(0.5) == 2);
-    REQUIRE(cfd::classify_risk_tier(1.0) == 2);
-}
-
-TEST_CASE("CFD risk tier - medium risk (0.01 - 0.1)", "[cfd][risk]") {
-    REQUIRE(cfd::classify_risk_tier(0.01) == 1);
-    REQUIRE(cfd::classify_risk_tier(0.05) == 1);
-    REQUIRE(cfd::classify_risk_tier(0.099) == 1);
-}
-
-TEST_CASE("CFD risk tier - low risk (< 0.01)", "[cfd][risk]") {
-    REQUIRE(cfd::classify_risk_tier(0.0) == 0);
-    REQUIRE(cfd::classify_risk_tier(0.001) == 0);
-    REQUIRE(cfd::classify_risk_tier(0.009) == 0);
-}
-
-// ───────────────────────────────────────────────────────────────────────────
-// Predicted active tests
-// ───────────────────────────────────────────────────────────────────────────
-
-TEST_CASE("CFD is_predicted_active - default threshold 0.1", "[cfd][active]") {
-    REQUIRE(cfd::is_predicted_active(0.1) == true);
-    REQUIRE(cfd::is_predicted_active(0.5) == true);
-    REQUIRE(cfd::is_predicted_active(0.09) == false);
-    REQUIRE(cfd::is_predicted_active(0.0) == false);
-}
-
-TEST_CASE("CFD is_predicted_active - custom threshold", "[cfd][active]") {
-    REQUIRE(cfd::is_predicted_active(0.05, 0.05) == true);
-    REQUIRE(cfd::is_predicted_active(0.04, 0.05) == false);
-    REQUIRE(cfd::is_predicted_active(0.01, 0.001) == true);
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -275,151 +234,5 @@ TEST_CASE("CFD is_predicted_active - custom threshold", "[cfd][active]") {
 TEST_CASE("ScoringInfo - default values", "[cfd][struct]") {
     ScoringInfo info;
     REQUIRE(info.cfd_score == 0.0);
-    REQUIRE(info.risk_tier == 0);
-}
-
-TEST_CASE("ScoringInfo - is_predicted_active method", "[cfd][struct]") {
-    ScoringInfo info;
-    info.cfd_score = 0.15;
-
-    REQUIRE(info.is_predicted_active() == true);
-    REQUIRE(info.is_predicted_active(0.1) == true);
-    REQUIRE(info.is_predicted_active(0.2) == false);
-}
-
-// ───────────────────────────────────────────────────────────────────────────
-// MIT Specificity Score tests
-// ───────────────────────────────────────────────────────────────────────────
-
-TEST_CASE("MIT specificity - empty input returns 100.0", "[mit][specificity]") {
-    std::vector<double> empty_scores;
-    REQUIRE(cfd::compute_mit_specificity_score(empty_scores) == 100.0);
-}
-
-TEST_CASE("MIT specificity - single off-target with low CFD", "[mit][specificity]") {
-    // Formula: 100 / (100 + sum(CFD))
-    // With one CFD=0.1: 100 / (100 + 0.1) = 100 / 100.1 ≈ 99.9
-    std::vector<double> scores = {0.1};
-    double expected = 100.0 / (100.0 + 0.1);
-    REQUIRE_THAT(cfd::compute_mit_specificity_score(scores),
-                 WithinAbs(expected, 0.01));
-}
-
-TEST_CASE("MIT specificity - single off-target with high CFD", "[mit][specificity]") {
-    // With one CFD=0.9: 100 / (100 + 0.9) = 100 / 100.9 ≈ 99.1
-    std::vector<double> scores = {0.9};
-    double expected = 100.0 / (100.0 + 0.9);
-    REQUIRE_THAT(cfd::compute_mit_specificity_score(scores),
-                 WithinAbs(expected, 0.01));
-}
-
-TEST_CASE("MIT specificity - multiple off-targets", "[mit][specificity]") {
-    // With CFD scores: [0.5, 0.3, 0.2]
-    // Sum = 1.0
-    // Score = 100 / (100 + 1.0) = 100 / 101 ≈ 99.01
-    std::vector<double> scores = {0.5, 0.3, 0.2};
-    double expected = 100.0 / (100.0 + 1.0);
-    REQUIRE_THAT(cfd::compute_mit_specificity_score(scores),
-                 WithinAbs(expected, 0.01));
-}
-
-TEST_CASE("MIT specificity - many off-targets reduces score", "[mit][specificity]") {
-    // 10 off-targets with CFD=0.5 each
-    // Sum = 5.0
-    // Score = 100 / (100 + 5.0) = 100 / 105 ≈ 95.24
-    std::vector<double> scores(10, 0.5);
-    double expected = 100.0 / (100.0 + 5.0);
-    REQUIRE_THAT(cfd::compute_mit_specificity_score(scores),
-                 WithinAbs(expected, 0.01));
-}
-
-TEST_CASE("MIT specificity - high off-target burden", "[mit][specificity]") {
-    // 100 off-targets with CFD=0.2 each
-    // Sum = 20.0
-    // Score = 100 / (100 + 20.0) = 100 / 120 ≈ 83.33
-    std::vector<double> scores(100, 0.2);
-    double expected = 100.0 / (100.0 + 20.0);
-    REQUIRE_THAT(cfd::compute_mit_specificity_score(scores),
-                 WithinAbs(expected, 0.01));
-}
-
-TEST_CASE("MIT specificity - perfect matches excluded by default", "[mit][specificity]") {
-    // By default, perfect matches (CFD=1.0) should NOT be excluded
-    // This differs from some implementations that exclude the on-target
-    std::vector<double> scores = {1.0, 0.5, 0.3};
-    double sum_with_perfect = 1.0 + 0.5 + 0.3;  // = 1.8
-    double expected = 100.0 / (100.0 + sum_with_perfect);
-    
-    REQUIRE_THAT(cfd::compute_mit_specificity_score(scores, false),
-                 WithinAbs(expected, 0.01));
-}
-
-TEST_CASE("MIT specificity - include perfect matches option", "[mit][specificity]") {
-    // When include_perfect_matches=true, all scores are included
-    std::vector<double> scores = {1.0, 0.5, 0.3};
-    double sum_all = 1.8;
-    double expected = 100.0 / (100.0 + sum_all);
-    
-    REQUIRE_THAT(cfd::compute_mit_specificity_score(scores, true),
-                 WithinAbs(expected, 0.01));
-}
-
-TEST_CASE("MIT specificity - zero CFD scores", "[mit][specificity]") {
-    // Off-targets with CFD=0.0 don't contribute to sum
-    std::vector<double> scores = {0.0, 0.0, 0.5, 0.0};
-    double expected = 100.0 / (100.0 + 0.5);
-    REQUIRE_THAT(cfd::compute_mit_specificity_score(scores),
-                 WithinAbs(expected, 0.01));
-}
-
-TEST_CASE("MIT specificity - mixed CFD scores realistic scenario", "[mit][specificity]") {
-    // Realistic scenario: various off-targets with different CFD scores
-    std::vector<double> scores = {
-        0.8, 0.6, 0.4, 0.3, 0.2,  // 5 high-scoring off-targets
-        0.1, 0.1, 0.05, 0.05, 0.01 // 5 low-scoring off-targets
-    };
-    double sum = 0.8 + 0.6 + 0.4 + 0.3 + 0.2 + 0.1 + 0.1 + 0.05 + 0.05 + 0.01;
-    double expected = 100.0 / (100.0 + sum);
-    REQUIRE_THAT(cfd::compute_mit_specificity_score(scores),
-                 WithinAbs(expected, 0.01));
-}
-
-// ───────────────────────────────────────────────────────────────────────────
-// MIT Specificity tier classification tests
-// ───────────────────────────────────────────────────────────────────────────
-
-TEST_CASE("MIT tier - poor specificity (< 20)", "[mit][tier]") {
-    REQUIRE(cfd::classify_specificity_tier(0.0) == 0);
-    REQUIRE(cfd::classify_specificity_tier(10.0) == 0);
-    REQUIRE(cfd::classify_specificity_tier(19.9) == 0);
-}
-
-TEST_CASE("MIT tier - fair specificity (20-50)", "[mit][tier]") {
-    REQUIRE(cfd::classify_specificity_tier(20.0) == 1);
-    REQUIRE(cfd::classify_specificity_tier(35.0) == 1);
-    REQUIRE(cfd::classify_specificity_tier(49.9) == 1);
-}
-
-TEST_CASE("MIT tier - good specificity (50-80)", "[mit][tier]") {
-    REQUIRE(cfd::classify_specificity_tier(50.0) == 2);
-    REQUIRE(cfd::classify_specificity_tier(65.0) == 2);
-    REQUIRE(cfd::classify_specificity_tier(79.9) == 2);
-}
-
-TEST_CASE("MIT tier - excellent specificity (>= 80)", "[mit][tier]") {
-    REQUIRE(cfd::classify_specificity_tier(80.0) == 3);
-    REQUIRE(cfd::classify_specificity_tier(90.0) == 3);
-    REQUIRE(cfd::classify_specificity_tier(99.9) == 3);
-    REQUIRE(cfd::classify_specificity_tier(100.0) == 3);
-}
-
-TEST_CASE("MIT tier - boundary conditions", "[mit][tier]") {
-    // Test exact boundaries
-    REQUIRE(cfd::classify_specificity_tier(19.999) == 0);
-    REQUIRE(cfd::classify_specificity_tier(20.0) == 1);
-    REQUIRE(cfd::classify_specificity_tier(49.999) == 1);
-    REQUIRE(cfd::classify_specificity_tier(50.0) == 2);
-    REQUIRE(cfd::classify_specificity_tier(79.999) == 2);
-    REQUIRE(cfd::classify_specificity_tier(80.0) == 3);
 }
 
