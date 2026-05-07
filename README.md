@@ -51,16 +51,4 @@ Use `--spacer-summary summary.tsv` for per-spacer aggregates (hit counts by dist
 - **Hamming mode searches by Hamming distance but aligns by edit distance.** So `--distance-mode hamming` output may still contain indels in the alignment column — the search found the position via mismatch counting, but the reported CIGAR is the optimal edit-distance alignment at that position. If you need strict mismatch-only output, post-filter rows whose `cigar` contains `I` or `D`, or use `--no-compute-mismatches` to skip alignment entirely.
 - **U→T normalization is on by default.** RNA spacers work out of the box. Disable with `--no-treat-u-as-t` if you want strict validation.
 
-## Citation
-
-```bibtex
-@software{Stomata2026,
-  author  = {Simpson, Danny and Sanjana, Neville E. and Lappalainen, Tuuli},
-  title   = {Stomata: GPU-accelerated exhaustive CRISPR off-target search},
-  year    = {2026},
-  version = {0.10.0},
-  url     = {https://github.com/simpsondl/stomata}
-}
-```
-
 Issues: https://github.com/simpsondl/stomata/issues
