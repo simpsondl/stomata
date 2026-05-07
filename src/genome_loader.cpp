@@ -336,13 +336,13 @@ MappedGenome& MappedGenome::operator=(MappedGenome&& other) noexcept {
 
 // Index file format utilities
 
-bool is_cystidia_index(const std::string& filepath) {
+bool is_stomata_index(const std::string& filepath) {
     return filepath.size() >= 3 &&
-           filepath.compare(filepath.size() - 3, 3, ".cy") == 0;
+           filepath.compare(filepath.size() - 3, 3, ".st") == 0;
 }
 
 // Header layout (64 bytes total):
-//   0-7:   Magic bytes "CYSTIDIA"
+//   0-7:   Magic bytes "STOMATA1"
 //   8-15:  Version (uint64_t)
 //  16-23:  total_bases (uint64_t)
 //  24-31:  num_chromosomes (uint64_t)
@@ -378,8 +378,8 @@ void write_genome_index(const Genome& genome, const std::string& filepath) {
     bitvector_offset = (bitvector_offset + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
 
     // Write header
-    file.write(CYSTIDIA_INDEX_MAGIC, 8);
-    file.write(reinterpret_cast<const char*>(&CYSTIDIA_INDEX_VERSION), 8);
+    file.write(STOMATA_INDEX_MAGIC, 8);
+    file.write(reinterpret_cast<const char*>(&STOMATA_INDEX_VERSION), 8);
     file.write(reinterpret_cast<const char*>(&genome.total_bases), 8);
     file.write(reinterpret_cast<const char*>(&num_chromosomes), 8);
     file.write(reinterpret_cast<const char*>(&chrom_table_offset), 8);
@@ -449,14 +449,14 @@ MappedGenome load_genome_index(const std::string& filepath) {
     }
 
     // Check magic bytes
-    if (std::memcmp(data, CYSTIDIA_INDEX_MAGIC, 8) != 0) {
+    if (std::memcmp(data, STOMATA_INDEX_MAGIC, 8) != 0) {
         throw std::runtime_error("Invalid index file magic: " + filepath);
     }
 
     // Read header fields
     uint64_t version;
     std::memcpy(&version, data + 8, 8);
-    if (version != CYSTIDIA_INDEX_VERSION) {
+    if (version != STOMATA_INDEX_VERSION) {
         throw std::runtime_error("Unsupported index version " +
                                   std::to_string(version) + " in: " + filepath);
     }

@@ -7,13 +7,16 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <functional>
 #include <initializer_list>
+#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <string>
+#include <unistd.h>
 #include <vector>
 
 // Usage / Help
@@ -21,13 +24,13 @@
 static void print_usage(const char* program_name) {
     std::cout << "Usage: " << program_name << " [OPTIONS]\n"
               << "\n"
-              << "Cystidia - Exhaustive CRISPR off-target search engine\n"
+              << "Stomata - Exhaustive CRISPR off-target search engine\n"
               << "\n"
               << "Required arguments (one of):\n"
               << "  --pattern PATTERN        Nucleotide pattern to search for (ACGTNacgtn)\n"
               << "  --spacer-file FILE       File with spacer sequences (one per line; use '-' for stdin)\n"
-              << "  --index-genome FILE      Create .cy index from FASTA (no search)\n"
-              << "  --genome FILE            Path to genome FASTA or .cy index file\n"
+              << "  --index-genome FILE      Create .st index from FASTA (no search)\n"
+              << "  --genome FILE            Path to genome FASTA or .st index file\n"
               << "\n"
               << "Optional arguments:\n"
               << "  --region REGION          Restrict search to CHR or CHR:START-END (1-based, inclusive-exclusive)\n"
@@ -82,6 +85,8 @@ static void print_usage(const char* program_name) {
               << "Information:\n"
               << "  --help                   Show this help message and exit\n"
               << "  --version                Show version information and exit\n"
+              << "  --quickstart             Run a self-contained smoke test (no genome/spacer needed)\n"
+              << "                           and report whether Stomata is functional on this system.\n"
               << "\n"
               << "Spacer file format:\n"
               << "  # Lines starting with # are comments\n"
@@ -93,8 +98,8 @@ static void print_usage(const char* program_name) {
               << "  " << program_name << " --pattern ACGTACGTACGTACGTACGT --genome hg38.fa --threshold 3\n"
               << "  " << program_name << " --spacer-file guides.txt --genome hg38.fa --threshold 3\n"
               << "  " << program_name << " --pattern ACGTACGTACGTACGTACGT --genome hg38.fa --pam NGG --max-hits 1000\n"
-              << "  " << program_name << " --index-genome hg38.fa                  # Creates hg38.fa.cy\n"
-              << "  " << program_name << " --genome hg38.fa.cy --pattern ...    # Uses mmap for fast load\n"
+              << "  " << program_name << " --index-genome hg38.fa                  # Creates hg38.fa.st\n"
+              << "  " << program_name << " --genome hg38.fa.st --pattern ...    # Uses mmap for fast load\n"
               << "\n"
               << "Distance modes:\n"
               << "  levenshtein              Full edit distance (substitutions + indels) - default\n"
@@ -107,13 +112,13 @@ static void print_usage(const char* program_name) {
               << "  - --pam accepts IUPAC codes (R, Y, S, W, K, M, B, D, H, V, N); supply one pattern per run\n"
               << "  - PAM filtering requires --compute-mismatches (default on)\n"
               << "  - Batch mode (--spacer-file) loads genome once for all spacers\n"
-              << "  - .cy index files are memory-mapped for instant loading\n"
+              << "  - .st index files are memory-mapped for instant loading\n"
               << "  - Hamming mode is faster but does not account for insertions/deletions\n"
               << "\n";
 }
 
 static void print_version() {
-    std::cout << "cystidia version " << CYSTIDIA_VERSION << "\n"
+    std::cout << "stomata version " << STOMATA_VERSION << "\n"
               << "Built with GPU support: " << (gpu_available() ? "yes" : "no") << "\n";
 }
 
@@ -147,6 +152,7 @@ struct Arguments {
     bool quiet = false;
     bool show_help = false;
     bool show_version = false;
+    bool quickstart = false;
     StrandMode strand_mode = StrandMode::BOTH;
     bool compute_mismatches = true;
     bool compute_scores = true;  // CFD activity scoring (default: on)
@@ -210,6 +216,7 @@ const std::vector<OptionDef>& option_table() {
     static const std::vector<OptionDef> kOptions = {
         {"--help", "-h", false, [](Arguments& a, const char*){ a.show_help = true; return true; }},
         {"--version", "-v", false, [](Arguments& a, const char*){ a.show_version = true; return true; }},
+        {"--quickstart", nullptr, false, [](Arguments& a, const char*){ a.quickstart = true; return true; }},
 
         {"--pattern",      nullptr, true, [](Arguments& a, const char* v){ a.pattern      = v; return true; }},
         {"--spacer-file",  nullptr, true, [](Arguments& a, const char* v){ a.spacer_file  = v; return true; }},
@@ -357,7 +364,10 @@ static bool parse_arguments(int argc, char** argv, Arguments& args) {
 
         if (!opt->apply(args, value)) return false;
 
-        // Preserve prior short-circuit: --help / --version stop further parsing.
+        // Preserve prior short-circuit: --help / --version stop further
+        // parsing (those code paths intentionally ignore everything else).
+        // --quickstart is NOT short-circuited so it can compose with
+        // --cpu-only / --threads / --verbose etc. for portability checks.
         if (args.show_help || args.show_version) return true;
     }
     return true;
@@ -426,8 +436,20 @@ static bool validate_arguments(const Arguments& args) {
         }
     }
 
-    if (!args.pam_pattern.empty() && !args.compute_mismatches) {
-        std::cerr << "Error: --pam requires --compute-mismatches (default on)\n";
+    // --pam + --no-compute-mismatches:
+    //   Hamming mode — allowed. Hamming has no bulges; the canonical PAM is
+    //     authoritative and the early filter is exact.
+    //   Levenshtein mode — rejected. The widened early filter accepts hits
+    //     whose PAM matches at any candidate target length; the principled
+    //     re-filter that drops false positives (alignment-validity check)
+    //     runs inside the compute_mismatches block. Without compute_mismatches
+    //     the false positives are returned (see v0.8.0 fix).
+    if (!args.pam_pattern.empty() && !args.compute_mismatches &&
+        args.distance_mode == "levenshtein") {
+        std::cerr << "Error: --pam requires --compute-mismatches in Levenshtein "
+                     "mode (the alignment-validity re-filter cannot run otherwise). "
+                     "Use --distance-mode hamming if you need --no-compute-mismatches "
+                     "with --pam.\n";
         return false;
     }
 
@@ -435,6 +457,158 @@ static bool validate_arguments(const Arguments& args) {
 }
 
 // Subcommand handlers
+
+// Self-contained smoke test for hardware portability checks. Bundles a tiny
+// synthetic FASTA in the binary, runs Stomata on it under three configurations
+// (Lev+NGG, Lev no-PAM, Hamming+NGG), and verifies hit counts/distances
+// match the engineered ground truth. Exit code 0 on pass, non-zero on fail.
+//
+// Designed to be one-liner: `stomata --quickstart`.
+//
+// What it exercises end-to-end:
+//   - FASTA parsing (load_fasta)
+//   - GPU search dispatch (Myers and shift-add kernels)
+//   - PAM filter (NGG)
+//   - Lev's alignment-validity re-filter (v0.8.0 fix)
+//   - Mismatch info / CIGAR construction
+//   - CFD scoring
+//
+// What it does NOT exercise: index format (.st), batch mode, very long
+// patterns (uint64 kernel branch), large genomes. Those are covered by
+// the test suite (`ctest`).
+static int run_quickstart(const Arguments& args) {
+    // Synthetic genome: 3 deliberately placed sites for the test pattern
+    // GAGTCCGAGCAGAAGAAGAA.
+    //   Site 1 (offset  0): exact match,  PAM = AGG (NGG ✓)
+    //   Site 2 (offset 50): 1 mismatch,   PAM = TGG (NGG ✓)
+    //   Site 3 (offset 100): exact match, PAM = AAA (NGG ✗)
+    // Expected:
+    //   Lev+NGG / Hamming+NGG: 2 hits (sites 1, 2)
+    //   Lev or Hamming, no PAM: 3 hits (sites 1, 2, 3)
+    static const char* kPattern = "GAGTCCGAGCAGAAGAAGAA";
+    static const char* kFasta =
+        ">chr_quickstart synthetic-self-test\n"
+        // Site 1: exact + AGG (NGG)        : positions 0..22
+        "GAGTCCGAGCAGAAGAAGAAAGG"
+        // padding                          : positions 23..49 (27 bp)
+        "TTTTTTAAAAACCCCCAAAAAGTGTTC"
+        // Site 2: 1 mm at pos 12 + TGG     : positions 50..72
+        "AGAGTCCGAGCAGTAGAAGAATGG"
+        // padding                          : positions 73..99 (26 bp)
+        "AAAAAAGGGGGCCCCCAAAAAACCAA"
+        // Site 3: exact + AAA (not NGG)    : positions 100..122
+        "AGAGTCCGAGCAGAAGAAGAAAAA"
+        // tail padding                     : positions 123..159
+        "ACGTACGTACGTACGTACGTACGTACGTACGTACGT\n";
+
+    // Write to a tmp file (load_fasta needs a path).
+    char tmpdir[] = "/tmp/stomata-quickstart-XXXXXX";
+    if (!::mkdtemp(tmpdir)) {
+        std::cerr << "FAIL: could not create tmpdir for quickstart\n";
+        return 1;
+    }
+    const std::string fasta_path = std::string(tmpdir) + "/quickstart.fa";
+    {
+        std::ofstream f(fasta_path);
+        if (!f) {
+            std::cerr << "FAIL: could not write quickstart fasta to " << fasta_path << "\n";
+            return 1;
+        }
+        f << kFasta;
+    }
+
+    auto cleanup = [&]() {
+        std::remove(fasta_path.c_str());
+        ::rmdir(tmpdir);
+    };
+
+    std::cout << "Stomata quickstart\n";
+    std::cout << "  version:     " << STOMATA_VERSION << "\n";
+    std::cout << "  GPU built-in: " << (gpu_available() ? "yes" : "no") << "\n\n";
+
+    Genome genome;
+    try {
+        genome = load_fasta(fasta_path);
+    } catch (const std::exception& e) {
+        std::cerr << "FAIL [load_fasta]: " << e.what() << "\n";
+        cleanup();
+        return 1;
+    }
+
+    auto run_one = [&](const std::string& label,
+                       DistanceMode mode,
+                       const std::string& pam,
+                       size_t expected_hits) -> bool {
+        SearchConfig config;
+        config.pattern = kPattern;
+        config.threshold = 3;
+        config.distance_mode = mode;
+        if (!pam.empty()) {
+            config.pam.pattern = pam;
+            config.pam.position = PamPosition::THREE_PRIME;
+            config.pam.extract_length = pam.size();
+        }
+        config.compute_mismatches = true;
+        config.compute_scores = true;
+        config.search_both_strands = true;
+        config.prefer_gpu = !args.cpu_only;
+
+        auto t0 = std::chrono::high_resolution_clock::now();
+        SearchResult result;
+        try {
+            result = search_genome(config, make_view(genome));
+        } catch (const std::exception& e) {
+            std::cerr << "FAIL [" << label << "]: " << e.what() << "\n";
+            return false;
+        }
+        auto t1 = std::chrono::high_resolution_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+        const bool ok = (result.hits.size() == expected_hits);
+        std::cout << "  " << (ok ? "[ok]   " : "[FAIL] ")
+                  << label << ": "
+                  << result.hits.size() << " hits "
+                  << "(expected " << expected_hits << "), "
+                  << std::fixed << std::setprecision(1) << ms << " ms"
+                  << (result.used_gpu ? " [GPU]" : " [CPU]")
+                  << "\n";
+
+        if (!ok) {
+            for (size_t i = 0; i < result.hits.size(); ++i) {
+                const auto& h = result.hits[i];
+                std::cout << "      hit " << i << ": "
+                          << h.chrom_name << ":"
+                          << h.chrom_offset << " "
+                          << static_cast<char>(h.strand)
+                          << " d=" << static_cast<int>(h.distance)
+                          << " pam=" << (h.mismatch_info.pam_sequence.empty()
+                                          ? "." : h.mismatch_info.pam_sequence)
+                          << "\n";
+            }
+        }
+        return ok;
+    };
+
+    bool all_ok = true;
+    all_ok &= run_one("Hamming + NGG    ", DistanceMode::HAMMING,     "NGG", 2);
+    all_ok &= run_one("Hamming PAM-agn  ", DistanceMode::HAMMING,     "",    3);
+    all_ok &= run_one("Lev + NGG        ", DistanceMode::LEVENSHTEIN, "NGG", 2);
+    all_ok &= run_one("Lev PAM-agnostic ", DistanceMode::LEVENSHTEIN, "",    3);
+
+    cleanup();
+
+    std::cout << "\n";
+    if (all_ok) {
+        std::cout << "Quickstart PASS — Stomata is functional on this system.\n";
+        return 0;
+    } else {
+        std::cout << "Quickstart FAIL — see hit details above. "
+                     "Likely causes: GPU compute capability not in the binary's "
+                     "SASS targets, or a broken CUDA install. See INSTALL.md "
+                     "Troubleshooting.\n";
+        return 1;
+    }
+}
 
 static int run_index_mode(const Arguments& args) {
     if (!args.quiet) {
@@ -453,7 +627,7 @@ static int run_index_mode(const Arguments& args) {
     }
 
     std::string index_path = args.output_path.empty()
-                             ? args.index_genome + ".cy"
+                             ? args.index_genome + ".st"
                              : args.output_path;
 
     auto write_start = std::chrono::high_resolution_clock::now();
@@ -789,7 +963,7 @@ static std::string run_single_search(const Arguments& args, GenomeView view,
     return formatted;
 }
 
-// Open the genome (auto-detect .cy for memory-mapped loading).
+// Open the genome (auto-detect .st for memory-mapped loading).
 // genome_ptr and mapped_ptr are out-params; exactly one will be populated.
 static GenomeView load_genome_auto(const Arguments& args,
                                    std::unique_ptr<Genome>& genome_ptr,
@@ -801,7 +975,7 @@ static GenomeView load_genome_auto(const Arguments& args,
     auto load_start = std::chrono::high_resolution_clock::now();
     GenomeView view;
 
-    if (is_cystidia_index(args.genome_path)) {
+    if (is_stomata_index(args.genome_path)) {
         mapped_ptr = std::make_unique<MappedGenome>(load_genome_index(args.genome_path));
         view = make_view(*mapped_ptr);
         if (args.verbose) {
@@ -837,6 +1011,7 @@ int main(int argc, char** argv) {
 
     if (args.show_help)    { print_usage(argv[0]); return 0; }
     if (args.show_version) { print_version();      return 0; }
+    if (args.quickstart)   { return run_quickstart(args); }
 
     if (!validate_arguments(args)) {
         std::cerr << "Run '" << argv[0] << " --help' for usage.\n";

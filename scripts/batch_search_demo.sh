@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-CYSTIDIA_BIN="./build/src/cystidia"
+STOMATA_BIN="./build/src/stomata"
 GENOME="path/to/genomes/GRCh38.p14/hg38.p14.canonical.fa"
 THRESHOLD=4
 
@@ -40,4 +40,4 @@ echo "Speedup: 3.9x faster for 5 spacers"
 echo "         5.0x faster for 10 spacers"
 echo "        10.0x faster for 50 spacers"
 echo ""
-echo "This requires adding batch mode to cystidia CLI (future enhancement)"
+echo "This requires adding batch mode to stomata CLI (future enhancement)"

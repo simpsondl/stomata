@@ -35,6 +35,15 @@ constexpr size_t PARALLEL_HITS_MIN_COUNT = 100;
 // Need at least this many hits per worker thread for parallelism to pay off.
 constexpr size_t PARALLEL_MIN_CHUNK_SIZE = 50;
 
+// Per-worker batch size for the work-stealing dispatch in
+// parallel_process_hits. Each worker grabs PARALLEL_DISPATCH_CHUNK hits per
+// atomic increment instead of one. At the 19M-hit / 64-thread regime the
+// single-counter atomic was the contention bottleneck (5× observed
+// parallelism on a 64-core machine; chunked dispatch lifts that toward the
+// memory-bandwidth ceiling). A chunk of 64 cuts atomic traffic 64× while
+// keeping the tail-imbalance bounded to <0.001% of the workload.
+constexpr size_t PARALLEL_DISPATCH_CHUNK = 64;
+
 }  // namespace
 
 bool cigar_has_indel(const std::string& cigar) {
@@ -266,14 +275,23 @@ static void parallel_process_hits(std::vector<SearchHit>& hits,
         return;
     }
 
-    // Parallel path: Work-stealing pattern
-    std::atomic<size_t> next_index{0};
+    // Parallel path: chunked work-stealing. Each worker grabs
+    // PARALLEL_DISPATCH_CHUNK hits per atomic increment to amortize the
+    // contention cost at high thread counts. Single-counter dispatch was
+    // the bottleneck at 19M hits / 64 threads (only ~5× parallelism observed
+    // on a 64-core machine despite no per-hit data dependency); chunked
+    // dispatch reduces atomic traffic by PARALLEL_DISPATCH_CHUNK× while
+    // preserving work-stealing's load-balancing property.
+    std::atomic<size_t> next_chunk_start{0};
 
     auto worker = [&]() {
         while (true) {
-            size_t i = next_index.fetch_add(1);
-            if (i >= hit_count) break;
-            func(hits[i]);
+            size_t chunk_start = next_chunk_start.fetch_add(PARALLEL_DISPATCH_CHUNK);
+            if (chunk_start >= hit_count) break;
+            size_t chunk_end = std::min(chunk_start + PARALLEL_DISPATCH_CHUNK, hit_count);
+            for (size_t i = chunk_start; i < chunk_end; ++i) {
+                func(hits[i]);
+            }
         }
     };
 
@@ -301,19 +319,18 @@ static void parallel_process_hits(std::vector<SearchHit>& hits,
 // "3'-PAM" in the hit's orientation therefore sits *before* align_begin on the
 // forward strand (RC'd to restore orientation), and the "5'-PAM" sits *after*
 // the end of the window. Plus strand is the mirror of that.
-static void extract_pam_bases(const GenomeView& view, SearchHit& hit,
-                              size_t pattern_len, const PamSpec& pam_spec) {
+// Free-function variant: read PAM bases given only (end_pos, strand). Used
+// to pre-filter sparse GPU hits before materializing a full SearchHit.
+static std::string read_pam_sequence(const GenomeView& view,
+                                     size_t end_pos, Strand strand,
+                                     size_t pattern_len,
+                                     const PamSpec& pam_spec) {
     const size_t L = pam_spec.effective_extract_length();
-    if (L == 0) {
-        hit.mismatch_info.pam_sequence.clear();
-        return;
-    }
+    if (L == 0) return {};
 
-    const size_t end_pos = hit.genome_pos;  // Myers end position (last text char of the window)
     const size_t align_begin = (end_pos >= pattern_len - 1) ? end_pos - pattern_len + 1 : 0;
-
     const bool three_prime_in_hit_orientation = (pam_spec.position == PamPosition::THREE_PRIME);
-    const bool plus = (hit.strand == Strand::PLUS);
+    const bool plus = (strand == Strand::PLUS);
 
     // Forward-strand side where the PAM bytes live:
     //   plus + 3'-PAM  -> after the window
@@ -326,26 +343,238 @@ static void extract_pam_bases(const GenomeView& view, SearchHit& hit,
     std::string bases;
     if (pam_after_window) {
         size_t pam_start = end_pos + 1;
-        if (pam_start >= view.total_bases) {
-            bases.clear();
-        } else {
-            size_t avail = view.total_bases - pam_start;
-            size_t take  = std::min(avail, L);
-            bases = extract_genome_slice(view, pam_start, take);
-        }
+        if (pam_start >= view.total_bases) return {};
+        size_t avail = view.total_bases - pam_start;
+        size_t take  = std::min(avail, L);
+        bases = extract_genome_slice(view, pam_start, take);
     } else {
-        if (align_begin == 0) {
-            bases.clear();
-        } else {
-            size_t take = std::min(align_begin, L);
-            bases = extract_genome_slice(view, align_begin - take, take);
-        }
+        if (align_begin == 0) return {};
+        size_t take = std::min(align_begin, L);
+        bases = extract_genome_slice(view, align_begin - take, take);
     }
 
     if (!plus) bases = reverse_complement(bases);
+    return bases;
+}
+
+static void extract_pam_bases(const GenomeView& view, SearchHit& hit,
+                              size_t pattern_len, const PamSpec& pam_spec) {
+    std::string bases = read_pam_sequence(view, hit.genome_pos, hit.strand,
+                                           pattern_len, pam_spec);
     hit.mismatch_info.pam_sequence = std::move(bases);
     hit.mismatch_info.pam_type =
         classify_pam_for_dedup(hit.mismatch_info.pam_sequence, pam_spec.position);
+}
+
+// Verify that `pattern` admits an alignment of edit distance ≤ threshold to a
+// target of *exactly* `tl` bases ending at `end_pos` in the hit's orientation.
+// Standard global edit-distance DP with row-min early exit. Used by the Lev
+// PAM post-filter: the widened PAM filter optimistically accepts hits whose
+// PAM matches at any candidate target length in [pattern_len ± threshold],
+// but does not check that the alignment at that length is actually valid.
+// For substitution-only canonical hits whose first `|PAM|` aligned bases
+// happen to look like a PAM (e.g. spacer 3' tail = NGG on minus strand), the
+// optimistic accept becomes a false positive. This helper closes the gap by
+// confirming that an alignment exists at the target length the PAM came from.
+static bool alignment_exists_at_target_length(
+        const std::string& pattern,
+        const GenomeView& view,
+        size_t end_pos,
+        Strand strand,
+        size_t tl,
+        int threshold) {
+    if (tl == 0) return false;
+    if (end_pos + 1 < tl) return false;
+    const size_t target_start = end_pos - tl + 1;
+    if (target_start + tl > view.total_bases) return false;
+
+    std::string target = extract_genome_slice(view, target_start, tl);
+    if (strand == Strand::MINUS) target = reverse_complement(target);
+
+    const size_t m = pattern.size();
+    const size_t n = target.size();
+
+    std::vector<int> prev(n + 1), curr(n + 1);
+    for (size_t j = 0; j <= n; ++j) prev[j] = static_cast<int>(j);
+
+    for (size_t i = 1; i <= m; ++i) {
+        curr[0] = static_cast<int>(i);
+        int row_min = curr[0];
+        const char p = static_cast<char>(std::toupper(static_cast<unsigned char>(pattern[i - 1])));
+        for (size_t j = 1; j <= n; ++j) {
+            const char t = static_cast<char>(std::toupper(static_cast<unsigned char>(target[j - 1])));
+            int match_cost;
+            if (p == 'N') match_cost = 0;
+            else if (t == 'N') match_cost = 1;
+            else match_cost = (p == t) ? 0 : 1;
+            curr[j] = std::min({
+                prev[j - 1] + match_cost,
+                prev[j] + 1,
+                curr[j - 1] + 1
+            });
+            if (curr[j] < row_min) row_min = curr[j];
+        }
+        if (row_min > threshold) return false;
+        prev.swap(curr);
+    }
+    return prev[n] <= threshold;
+}
+
+// Forward declarations for use in repopulate_hit_at_tl.
+static std::string format_cigar(const std::vector<AlignOp>& alignment);
+static std::string build_aligned_sequence_from_alignment(const std::vector<AlignOp>& alignment,
+                                                         const std::string& compare_sequence,
+                                                         size_t align_text_start);
+
+// Pinned-tl global alignment with traceback. Used by the v0.10.0 Lev
+// post-filter: when a hit is accepted on the basis of an alt-tl PAM
+// match, the canonical (best-d) alignment doesn't describe the tl that
+// justifies keeping the hit, so we re-derive distance/CIGAR/aligned_seq
+// from the alt-tl alignment instead.
+//
+// Both ends pinned (no free start/end gaps). Pattern fully consumed,
+// target (length `tl`) fully consumed. Pattern N is wildcard (cost 0);
+// genome N is masked (cost 1).
+//
+// Returns the alignment (in MATCH > INS_TEXT > INS_PATTERN tie-break
+// order) and ambiguity flag. If d > threshold, alignment is empty and
+// distance is set to threshold+1 as a sentinel.
+struct PinnedAlignResult {
+    int distance;
+    std::vector<AlignOp> alignment;  // forward order; covers all pattern + all target
+    bool has_ambiguity;
+    size_t n_ambiguous_cells;
+};
+
+static PinnedAlignResult align_pinned_tl(const std::string& pattern,
+                                          const std::string& target,
+                                          int threshold) {
+    PinnedAlignResult out{};
+    out.distance = threshold + 1;
+
+    const size_t m = pattern.size();
+    const size_t n = target.size();
+
+    std::vector<std::vector<int>> dp(m + 1, std::vector<int>(n + 1));
+    for (size_t i = 0; i <= m; ++i) dp[i][0] = static_cast<int>(i);
+    for (size_t j = 0; j <= n; ++j) dp[0][j] = static_cast<int>(j);
+
+    for (size_t i = 1; i <= m; ++i) {
+        const char p = static_cast<char>(std::toupper(static_cast<unsigned char>(pattern[i - 1])));
+        int row_min = std::numeric_limits<int>::max();
+        for (size_t j = 1; j <= n; ++j) {
+            const char t = static_cast<char>(std::toupper(static_cast<unsigned char>(target[j - 1])));
+            int match_cost;
+            if (p == 'N') match_cost = 0;
+            else if (t == 'N') match_cost = 1;
+            else match_cost = (p == t) ? 0 : 1;
+            dp[i][j] = std::min({
+                dp[i - 1][j - 1] + match_cost,
+                dp[i - 1][j] + 1,
+                dp[i][j - 1] + 1
+            });
+            if (dp[i][j] < row_min) row_min = dp[i][j];
+        }
+        // Early exit if every cell in this row already exceeds threshold.
+        if (row_min > threshold) {
+            return out;
+        }
+    }
+
+    if (dp[m][n] > threshold) {
+        return out;
+    }
+    out.distance = dp[m][n];
+
+    // Traceback from (m, n) with tie-breaking: MATCH > INS_TEXT (DNA bulge)
+    // > INS_PATTERN (RNA bulge). Mirrors compute_alignment().
+    std::vector<AlignOp> alignment;
+    alignment.reserve(m + n);
+    bool has_ambig = false;
+    size_t n_ambig = 0;
+    size_t i = m, j = n;
+    while (i > 0 && j > 0) {
+        const char p = static_cast<char>(std::toupper(static_cast<unsigned char>(pattern[i - 1])));
+        const char t = static_cast<char>(std::toupper(static_cast<unsigned char>(target[j - 1])));
+        int match_cost;
+        if (p == 'N') match_cost = 0;
+        else if (t == 'N') match_cost = 1;
+        else match_cost = (p == t) ? 0 : 1;
+        const int current = dp[i][j];
+
+        const bool can_match = (current == dp[i - 1][j - 1] + match_cost);
+        const bool can_ins_text = (current == dp[i][j - 1] + 1);
+        const bool can_ins_pattern = (current == dp[i - 1][j] + 1);
+        const int n_optimal = (int)can_match + (int)can_ins_text + (int)can_ins_pattern;
+        if (n_optimal > 1) { has_ambig = true; ++n_ambig; }
+
+        if (can_match) {
+            alignment.push_back(AlignOp::MATCH);
+            --i; --j;
+        } else if (can_ins_text) {
+            alignment.push_back(AlignOp::INS_TEXT);
+            --j;
+        } else if (can_ins_pattern) {
+            alignment.push_back(AlignOp::INS_PATTERN);
+            --i;
+        } else {
+            break;  // shouldn't happen with correct DP
+        }
+    }
+    while (i > 0) { alignment.push_back(AlignOp::INS_PATTERN); --i; }
+    while (j > 0) { alignment.push_back(AlignOp::INS_TEXT);    --j; }
+    std::reverse(alignment.begin(), alignment.end());
+
+    out.alignment = std::move(alignment);
+    out.has_ambiguity = has_ambig;
+    out.n_ambiguous_cells = n_ambig;
+    return out;
+}
+
+// Re-derive a hit's mismatch_info from a pinned target-length alignment.
+// Replaces hit.distance, hit.mismatch_info.{cigar, aligned_sequence,
+// alignment_is_ambiguous, n_ambiguous_cells, pam_sequence, pam_type}.
+//
+// Used by the v0.10.0 Lev post-filter (Option A): when canonical PAM
+// (at text_consumed = best_d alignment's tl) doesn't match but an alt-tl
+// alignment does, this re-populates the hit so that distance/CIGAR/PAM
+// describe the SAME alignment topology — biologically the alignment
+// that justifies keeping the hit. Without this, aCFD scoring uses the
+// canonical (lower) distance while PAM display reflects the alt-tl
+// alignment, inflating the score for hits that are actually d > 0.
+//
+// Returns true if a valid d ≤ threshold alignment exists at this tl;
+// false (and leaves hit unchanged) otherwise.
+static bool repopulate_hit_at_tl(
+        const std::string& original_pattern,
+        GenomeView view,
+        const PamSpec& pam_spec,
+        SearchHit& hit,
+        size_t pinned_tl,
+        int threshold) {
+    if (pinned_tl == 0) return false;
+    if (hit.genome_pos + 1 < pinned_tl) return false;
+    const size_t target_start = hit.genome_pos - pinned_tl + 1;
+    if (target_start + pinned_tl > view.total_bases) return false;
+
+    std::string genome_seq = extract_genome_slice(view, target_start, pinned_tl);
+    std::string compare_sequence = (hit.strand == Strand::MINUS)
+        ? reverse_complement(genome_seq) : genome_seq;
+
+    PinnedAlignResult ar = align_pinned_tl(original_pattern, compare_sequence, threshold);
+    if (ar.distance > threshold) return false;
+
+    hit.distance = static_cast<uint8_t>(ar.distance);
+    hit.mismatch_info.cigar = format_cigar(ar.alignment);
+    hit.mismatch_info.aligned_sequence =
+        build_aligned_sequence_from_alignment(ar.alignment, compare_sequence, 0);
+    hit.mismatch_info.alignment_is_ambiguous = ar.has_ambiguity;
+    hit.mismatch_info.n_ambiguous_cells = static_cast<uint16_t>(
+        std::min<size_t>(ar.n_ambiguous_cells, std::numeric_limits<uint16_t>::max()));
+    // PAM at this pinned tl. extract_pam_bases reads pam_pat_len bases and
+    // populates pam_sequence + pam_type.
+    extract_pam_bases(view, hit, pinned_tl, pam_spec);
+    return true;
 }
 
 // Alignment computation
@@ -591,15 +820,15 @@ static void extract_mismatch_info(const std::string& original_pattern,
     const size_t align_len   = hit.genome_pos - align_start + 1;
     const std::string genome_seq = extract_genome_slice(view, align_start, align_len);
 
-    if (hit.mismatch_info.pam_sequence.empty()) {
-        extract_pam_bases(view, hit, m, pam_spec);
-    }
-
     const std::string& compare_pattern = original_pattern;
     std::string compare_sequence = (hit.strand == Strand::MINUS)
         ? reverse_complement(genome_seq) : genome_seq;
 
     if (hit.distance == 0) {
+        // No bulges possible → target length == pattern length.
+        if (hit.mismatch_info.pam_sequence.empty()) {
+            extract_pam_bases(view, hit, m, pam_spec);
+        }
         hit.mismatch_info.aligned_sequence =
             extract_aligned_region_perfect_match(compare_sequence, hit.strand, m);
         hit.mismatch_info.cigar = std::to_string(m) + "M";
@@ -618,6 +847,17 @@ static void extract_mismatch_info(const std::string& original_pattern,
         if (op == AlignOp::MATCH || op == AlignOp::INS_TEXT) ++text_consumed;
     }
     const size_t align_text_start = ar.best_j - text_consumed;
+
+    // v0.7.0: extract PAM using the actual aligned-target length (text_consumed),
+    // which may differ from the nominal pattern length m when target-side bulges
+    // shortened the target or query-side bulges lengthened it. Any pam_sequence
+    // that might have been set earlier is overwritten here so it reflects the
+    // true alignment geometry, not the filter's nominal-length guess.
+    if (text_consumed > 0) {
+        extract_pam_bases(view, hit, text_consumed, pam_spec);
+    } else if (hit.mismatch_info.pam_sequence.empty()) {
+        extract_pam_bases(view, hit, m, pam_spec);
+    }
 
     hit.mismatch_info.aligned_sequence = build_aligned_sequence_from_alignment(
         ar.alignment, compare_sequence, align_text_start);
@@ -751,14 +991,54 @@ SearchResult search_genome(const SearchConfig& config, GenomeView view) {
     size_t num_threads = std::thread::hardware_concurrency();
     if (num_threads == 0) num_threads = 1;
 
-    // Lazy PAM extraction: extract PAM first (cheap), filter, then run the
-    // full alignment annotation only for hits that pass the PAM filter.
-    const bool enable_lazy_pam = config.pam.filtering_enabled() && config.compute_mismatches;
+    // PAM filter (cheap, per-hit) is independent of per-hit mismatch
+    // extraction (CIGAR, aligned seq — expensive). Always filter when a
+    // PAM is set; compute mismatch info separately only when requested.
+    //
+    // v0.7.1: for Levenshtein with target-side bulges, the nominal pattern
+    // length is wrong for the PAM position on the bulge-sensitive side
+    // (plus-strand 5' PAM or minus-strand 3' PAM). Check a window of
+    // candidate target lengths and accept if any matches. See the batch
+    // path for the same logic and correctness notes.
+    if (config.pam.filtering_enabled()) {
+        const bool is_lev = (config.distance_mode == DistanceMode::LEVENSHTEIN);
+        const size_t pam_filter_threshold = is_lev
+            ? static_cast<size_t>(std::max(0, static_cast<int>(config.threshold)))
+            : 0;
+        const bool three_prime_pam =
+            (config.pam.position == PamPosition::THREE_PRIME);
+        const size_t pattern_len = config.pattern.size();
+        auto pam_sensitive_to_bulges = [&](Strand strand) {
+            const bool plus = (strand == Strand::PLUS);
+            const bool pam_after_window =
+                (plus && three_prime_pam) || (!plus && !three_prime_pam);
+            return !pam_after_window;
+        };
 
-    if (enable_lazy_pam) {
         parallel_process_hits(result.hits,
             [&](SearchHit& hit) {
-                extract_pam_bases(view, hit, config.pattern.size(), config.pam);
+                // Start with canonical PAM (nominal pattern_len).
+                extract_pam_bases(view, hit, pattern_len, config.pam);
+                if (!pam_matches_pattern(hit.mismatch_info.pam_sequence,
+                                         config.pam.pattern)
+                    && pam_filter_threshold > 0
+                    && pam_sensitive_to_bulges(hit.strand)) {
+                    // Try shifted target lengths (±threshold).
+                    const size_t lo = (pattern_len > pam_filter_threshold)
+                        ? pattern_len - pam_filter_threshold : 1;
+                    const size_t hi = pattern_len + pam_filter_threshold;
+                    for (size_t tl = lo; tl <= hi; ++tl) {
+                        std::string candidate = read_pam_sequence(
+                            view, hit.genome_pos, hit.strand, tl, config.pam);
+                        if (pam_matches_pattern(candidate, config.pam.pattern)) {
+                            hit.mismatch_info.pam_sequence = std::move(candidate);
+                            hit.mismatch_info.pam_type = classify_pam_for_dedup(
+                                hit.mismatch_info.pam_sequence,
+                                config.pam.position);
+                            break;
+                        }
+                    }
+                }
             },
             num_threads);
 
@@ -772,19 +1052,66 @@ SearchResult search_genome(const SearchConfig& config, GenomeView view) {
         }
 
         result.hits = std::move(filtered_hits);
+    }
 
+    if (config.compute_mismatches) {
         parallel_process_hits(result.hits,
             [&](SearchHit& hit) {
                 extract_mismatch_info(config.pattern, view, config.pam, hit);
             },
             num_threads);
-    } else {
-        if (config.compute_mismatches) {
-            parallel_process_hits(result.hits,
-                [&](SearchHit& hit) {
-                    extract_mismatch_info(config.pattern, view, config.pam, hit);
-                },
-                num_threads);
+
+        // v0.10.0 Lev PAM re-filter (single-pattern path). See batch path
+        // for full rationale. Picks the LOWEST-distance alt-tl among
+        // those with both (PAM matches at this tl) and (valid alignment
+        // at this tl).
+        if (config.pam.filtering_enabled() &&
+            config.distance_mode == DistanceMode::LEVENSHTEIN) {
+            const size_t pattern_len = config.pattern.size();
+            const size_t pam_filter_threshold =
+                static_cast<size_t>(std::max(0, static_cast<int>(config.threshold)));
+            const bool three_prime_pam =
+                (config.pam.position == PamPosition::THREE_PRIME);
+            auto pam_sensitive_to_bulges = [&](Strand strand) {
+                const bool plus = (strand == Strand::PLUS);
+                const bool pam_after_window =
+                    (plus && three_prime_pam) || (!plus && !three_prime_pam);
+                return !pam_after_window;
+            };
+
+            std::vector<SearchHit> kept;
+            kept.reserve(result.hits.size());
+            for (auto& h : result.hits) {
+                if (pam_matches_pattern(h.mismatch_info.pam_sequence,
+                                        config.pam.pattern)) {
+                    kept.push_back(std::move(h));
+                    continue;
+                }
+                if (!pam_sensitive_to_bulges(h.strand) || pam_filter_threshold == 0) {
+                    continue;
+                }
+                const size_t lo = (pattern_len > pam_filter_threshold)
+                    ? pattern_len - pam_filter_threshold : 1;
+                const size_t hi = pattern_len + pam_filter_threshold;
+                SearchHit best_hit;
+                bool have_best = false;
+                for (size_t tl = lo; tl <= hi; ++tl) {
+                    if (tl == pattern_len) continue;
+                    std::string candidate = read_pam_sequence(
+                        view, h.genome_pos, h.strand, tl, config.pam);
+                    if (!pam_matches_pattern(candidate, config.pam.pattern)) continue;
+                    SearchHit trial = h;
+                    if (!repopulate_hit_at_tl(
+                            config.pattern, view, config.pam, trial, tl,
+                            config.threshold)) continue;
+                    if (!have_best || trial.distance < best_hit.distance) {
+                        best_hit = std::move(trial);
+                        have_best = true;
+                    }
+                }
+                if (have_best) kept.push_back(std::move(best_hit));
+            }
+            result.hits = std::move(kept);
         }
     }
 
@@ -1200,28 +1527,6 @@ static BatchSearchResult search_genome_batch_gpu(
         result.total_positions = view.total_bases;
         result.used_gpu = true;
 
-        // Estimate hit count for reservation
-        size_t estimated_hits = 0;
-        if (do_fwd) estimated_hits += gpu_results[fwd_idx].hits.size();
-        if (do_rc)  estimated_hits += gpu_results[rc_idx].hits.size();
-        result.hits.reserve(estimated_hits);
-
-        if (do_fwd) {
-            for (const auto& sparse_hit : gpu_results[fwd_idx].hits) {
-                result.hits.push_back(make_search_hit(
-                    view, sparse_hit.position, sparse_hit.distance, Strand::PLUS));
-            }
-        }
-        if (do_rc) {
-            for (const auto& sparse_hit : gpu_results[rc_idx].hits) {
-                result.hits.push_back(make_search_hit(
-                    view, sparse_hit.position, sparse_hit.distance, Strand::MINUS));
-            }
-        }
-
-        // Sort hits by position
-        std::sort(result.hits.begin(), result.hits.end());
-
         // Thread count for parallel annotation.
         size_t num_threads = config.num_threads;
         if (num_threads == 0) {
@@ -1229,39 +1534,165 @@ static BatchSearchResult search_genome_batch_gpu(
             if (num_threads == 0) num_threads = 1;
         }
 
-        // Lazy PAM extraction with early filtering (see single-search path).
-        const bool enable_lazy_pam = config.pam.filtering_enabled() && config.compute_mismatches;
+        // Early PAM filter: when a PAM is set, drop non-matching sparse hits
+        // *before* materializing heavyweight SearchHit structs. On human
+        // Ham+NGG this skips ~98% of would-be SearchHit constructions (19M
+        // sparse hits → ~400K keepers), saving several seconds of allocation
+        // + string-construction overhead per 225-spacer run.
+        //
+        // Correctness note (v0.7.0): for Levenshtein mode, target-side bulges
+        // can shorten the aligned target region below `pattern_len`, shifting
+        // the PAM-adjacent position closer to the spacer. The true alignment
+        // length is in [pattern_len - threshold, pattern_len + threshold].
+        // Cases where PAM sits adjacent to the *align_begin* side of the
+        // window (plus-strand 5' PAM, minus-strand 3' PAM) depend on this
+        // length; the earlier v0.6.5 filter used only the nominal pattern_len
+        // and silently dropped ~28% of legitimate indel-containing hits.
+        // The fix below widens the filter's PAM search to cover every
+        // candidate alignment length in the valid range. The filter still
+        // conservatively drops only sparse hits that CANNOT host a valid PAM
+        // under any bulge configuration. The authoritative PAM sequence is
+        // re-derived from the full DP alignment in extract_mismatch_info()
+        // (where text_consumed is known exactly).
+        const bool do_pam_filter = config.pam.filtering_enabled();
+        const size_t pattern_len = spacer.sequence.size();
+        const bool is_lev = (config.distance_mode == DistanceMode::LEVENSHTEIN);
+        const size_t pam_filter_threshold = is_lev
+            ? static_cast<size_t>(std::max(0, static_cast<int>(config.threshold)))
+            : 0;
 
-        if (enable_lazy_pam) {
-            parallel_process_hits(result.hits,
-                [&](SearchHit& hit) {
-                    extract_pam_bases(view, hit, spacer.sequence.size(), config.pam);
-                },
-                num_threads);
+        // Determine whether the PAM position depends on align_begin (which
+        // shifts with target bulges) vs the fixed end_pos (which does not).
+        // The PAM filter only needs to widen its check for the former cases.
+        const bool three_prime_pam =
+            (config.pam.position == PamPosition::THREE_PRIME);
+        // PAM sits adjacent to align_begin (bulge-sensitive) on:
+        //   plus-strand + 5'-PAM  or  minus-strand + 3'-PAM
+        // PAM sits adjacent to end_pos (bulge-insensitive) on:
+        //   plus-strand + 3'-PAM  or  minus-strand + 5'-PAM
+        auto pam_sensitive_to_bulges = [&](Strand strand) {
+            const bool plus = (strand == Strand::PLUS);
+            const bool pam_after_window =
+                (plus && three_prime_pam) || (!plus && !three_prime_pam);
+            return !pam_after_window;
+        };
 
-            std::vector<SearchHit> filtered_hits;
-            filtered_hits.reserve(result.hits.size() / 10);
+        auto filter_pam_match = [&](size_t end_pos, Strand strand) -> bool {
+            if (!pam_filter_threshold || !pam_sensitive_to_bulges(strand)) {
+                // Fast path: PAM position independent of bulges, or Hamming mode.
+                std::string pam_seq = read_pam_sequence(
+                    view, end_pos, strand, pattern_len, config.pam);
+                return pam_matches_pattern(pam_seq, config.pam.pattern);
+            }
+            // Lev mode + bulge-sensitive side: check every candidate target
+            // length in [pattern_len - threshold, pattern_len + threshold].
+            const size_t lo = (pattern_len > pam_filter_threshold)
+                ? pattern_len - pam_filter_threshold : 1;
+            const size_t hi = pattern_len + pam_filter_threshold;
+            for (size_t target_len = lo; target_len <= hi; ++target_len) {
+                std::string pam_seq = read_pam_sequence(
+                    view, end_pos, strand, target_len, config.pam);
+                if (pam_matches_pattern(pam_seq, config.pam.pattern)) return true;
+            }
+            return false;
+        };
 
-            for (auto& hit : result.hits) {
-                if (pam_matches_pattern(hit.mismatch_info.pam_sequence, config.pam.pattern)) {
-                    filtered_hits.push_back(std::move(hit));
+        auto materialize_and_filter = [&](const std::vector<GpuSparseHit>& sparse,
+                                          Strand strand) {
+            for (const auto& sparse_hit : sparse) {
+                if (do_pam_filter) {
+                    if (!filter_pam_match(sparse_hit.position, strand)) continue;
+                    // Do NOT pre-populate pam_sequence here: for Lev with
+                    // bulges, the correct PAM depends on the actual alignment
+                    // length, which extract_mismatch_info derives below. In
+                    // Hamming mode pam_sequence is re-read there too (cheap),
+                    // so dropping the pre-populate is uniform.
+                    result.hits.push_back(make_search_hit(
+                        view, sparse_hit.position, sparse_hit.distance, strand));
+                } else {
+                    result.hits.push_back(make_search_hit(
+                        view, sparse_hit.position, sparse_hit.distance, strand));
                 }
             }
+        };
 
-            result.hits = std::move(filtered_hits);
+        // Reserve: for PAM-filtered runs, most hits drop — don't over-reserve.
+        size_t estimated_hits = 0;
+        if (do_fwd) estimated_hits += gpu_results[fwd_idx].hits.size();
+        if (do_rc)  estimated_hits += gpu_results[rc_idx].hits.size();
+        if (do_pam_filter) estimated_hits = estimated_hits / 10 + 1024;
+        result.hits.reserve(estimated_hits);
 
+        if (do_fwd) materialize_and_filter(gpu_results[fwd_idx].hits, Strand::PLUS);
+        if (do_rc)  materialize_and_filter(gpu_results[rc_idx].hits,  Strand::MINUS);
+
+        // Sort hits by position
+        std::sort(result.hits.begin(), result.hits.end());
+
+        if (config.compute_mismatches) {
             parallel_process_hits(result.hits,
                 [&](SearchHit& hit) {
                     extract_mismatch_info(spacer.sequence, view, config.pam, hit);
                 },
                 num_threads);
-        } else {
-            if (config.compute_mismatches) {
-                parallel_process_hits(result.hits,
-                    [&](SearchHit& hit) {
-                        extract_mismatch_info(spacer.sequence, view, config.pam, hit);
-                    },
-                    num_threads);
+
+            // v0.10.0 Lev PAM post-filter — full re-derivation when
+            // canonical PAM doesn't match (Option A).
+            //
+            // When the canonical (best-d) alignment's PAM doesn't match,
+            // search every alt-tl with matching PAM and re-derive the
+            // alignment from there. Pick the alt-tl with LOWEST distance
+            // (among PAM-matching ones with valid alignments). Without
+            // the lowest-d preference, the post-filter would pick an
+            // arbitrary alt-tl and inflate the displayed distance — and
+            // halo dedup would then collapse this hit with neighboring
+            // canonical-match hits using stale (high) distance, picking
+            // the wrong representative.
+            if (do_pam_filter && is_lev && pam_filter_threshold > 0) {
+                const size_t L = config.pam.effective_extract_length();
+                std::vector<SearchHit> kept;
+                kept.reserve(result.hits.size());
+                for (auto& h : result.hits) {
+                    // Fast path: canonical alignment already has matching PAM.
+                    if (pam_matches_pattern(h.mismatch_info.pam_sequence,
+                                            config.pam.pattern)) {
+                        kept.push_back(std::move(h));
+                        continue;
+                    }
+                    if (!pam_sensitive_to_bulges(h.strand)) {
+                        // PAM bulge-insensitive: canonical PAM is
+                        // authoritative, and it didn't match → drop.
+                        continue;
+                    }
+                    const size_t lo = (pattern_len > pam_filter_threshold)
+                        ? pattern_len - pam_filter_threshold : 1;
+                    const size_t hi = pattern_len + pam_filter_threshold;
+                    // Find the alt-tl with the LOWEST distance whose
+                    // alignment is valid AND whose PAM matches. We do
+                    // this in two passes so we don't waste time on the
+                    // expensive repopulate when a closer tl is around.
+                    SearchHit best_hit;
+                    bool have_best = false;
+                    for (size_t tl = lo; tl <= hi; ++tl) {
+                        if (tl == pattern_len) continue;
+                        std::string candidate = read_pam_sequence(
+                            view, h.genome_pos, h.strand, tl, config.pam);
+                        if (candidate.size() < L) continue;
+                        if (!pam_matches_pattern(candidate, config.pam.pattern)) continue;
+                        // Try the re-derivation. If alignment isn't valid
+                        // at this tl (d > threshold), skip.
+                        SearchHit trial = h;
+                        if (!repopulate_hit_at_tl(
+                                spacer.sequence, view, config.pam, trial, tl,
+                                config.threshold)) continue;
+                        if (!have_best || trial.distance < best_hit.distance) {
+                            best_hit = std::move(trial);
+                            have_best = true;
+                        }
+                    }
+                    if (have_best) kept.push_back(std::move(best_hit));
+                }
+                result.hits = std::move(kept);
             }
         }
 

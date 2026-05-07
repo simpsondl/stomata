@@ -1,6 +1,6 @@
 cff-version: 1.2.0
-message: "If you use Cystidia, please cite it as below."
-title: "Cystidia: GPU-accelerated exhaustive CRISPR off-target search"
+message: "If you use Stomata, please cite it as below."
+title: "Stomata: GPU-accelerated exhaustive CRISPR off-target search"
 type: software
 authors:
   - given-names: Danny
@@ -13,9 +13,9 @@ authors:
     family-names: Lappalainen
     affiliation: "New York Genome Center"
 license: MIT
-version: 0.6.0
-date-released: 2026-04-22
-repository-code: https://github.com/simpsondl/cystidia
+version: 0.10.0
+date-released: 2026-05-06
+repository-code: https://github.com/simpsondl/stomata
 keywords:
   - CRISPR
   - off-target

@@ -27,7 +27,7 @@ static bool get_bit(const std::vector<uint64_t>& bv, size_t pos) {
 // Used by parsing tests that need precise, small inputs without polluting
 // the checked-in test-data directory.
 static std::string write_temp_fasta(const std::string& content) {
-    auto path = fs::temp_directory_path() / "cystidia_test.fa";
+    auto path = fs::temp_directory_path() / "stomata_test.fa";
     std::ofstream out(path);
     out << content;
     return path.string();
@@ -296,7 +296,7 @@ TEST_CASE("gzip FASTA parsing - nonexistent .gz file throws",
 
 TEST_CASE("gzip FASTA parsing - corrupt .gz file throws",
           "[genome_loader][fasta][gzip]") {
-    auto path = fs::temp_directory_path() / "cystidia_test_corrupt.fa.gz";
+    auto path = fs::temp_directory_path() / "stomata_test_corrupt.fa.gz";
     {
         std::ofstream out(path, std::ios::binary);
         out.write("this is not valid gzip data", 27);
@@ -385,17 +385,17 @@ TEST_CASE("load_fasta - parses and encodes test_small.fa end-to-end",
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Cystidia Index (.cy format)
+// Stomata Index (.st format)
 // ───────────────────────────────────────────────────────────────────────────
 
-TEST_CASE("is_cystidia_index - detects .cy extension", "[genome_loader][index]") {
-    REQUIRE(is_cystidia_index("genome.cy"));
-    REQUIRE(is_cystidia_index("/path/to/hg38.fa.cy"));
-    REQUIRE(is_cystidia_index("a.cy"));
-    REQUIRE(is_cystidia_index(".cy"));  // Hidden file with .cy extension
-    REQUIRE(!is_cystidia_index("genome.fa"));
-    REQUIRE(!is_cystidia_index("genome.fa.gz"));
-    REQUIRE(!is_cystidia_index("cystidia"));  // Too short, no dot prefix
+TEST_CASE("is_stomata_index - detects .st extension", "[genome_loader][index]") {
+    REQUIRE(is_stomata_index("genome.st"));
+    REQUIRE(is_stomata_index("/path/to/hg38.fa.st"));
+    REQUIRE(is_stomata_index("a.st"));
+    REQUIRE(is_stomata_index(".st"));  // Hidden file with .st extension
+    REQUIRE(!is_stomata_index("genome.fa"));
+    REQUIRE(!is_stomata_index("genome.fa.gz"));
+    REQUIRE(!is_stomata_index("stomata"));  // Too short, no dot prefix
 }
 
 TEST_CASE("Index write/read round-trip - preserves genome data",
@@ -404,7 +404,7 @@ TEST_CASE("Index write/read round-trip - preserves genome data",
     Genome original = load_fasta(SMALL_FASTA);
 
     // Write to temporary index file
-    auto index_path = fs::temp_directory_path() / "cystidia_test_roundtrip.cy";
+    auto index_path = fs::temp_directory_path() / "stomata_test_roundtrip.st";
     write_genome_index(original, index_path.string());
 
     // Read back via memory mapping
@@ -440,7 +440,7 @@ TEST_CASE("GenomeView - works with both Genome and MappedGenome",
     Genome genome = load_fasta(SMALL_FASTA);
 
     // Write to index and read back
-    auto index_path = fs::temp_directory_path() / "cystidia_test_view.cy";
+    auto index_path = fs::temp_directory_path() / "stomata_test_view.st";
     write_genome_index(genome, index_path.string());
     MappedGenome mapped = load_genome_index(index_path.string());
 
@@ -469,7 +469,7 @@ TEST_CASE("extract_genome_slice - works with GenomeView from MappedGenome",
           "[genome_loader][index]") {
     // Load and create index
     Genome genome = load_fasta(SMALL_FASTA);
-    auto index_path = fs::temp_directory_path() / "cystidia_test_slice.cy";
+    auto index_path = fs::temp_directory_path() / "stomata_test_slice.st";
     write_genome_index(genome, index_path.string());
     MappedGenome mapped = load_genome_index(index_path.string());
 
@@ -490,11 +490,11 @@ TEST_CASE("extract_genome_slice - works with GenomeView from MappedGenome",
 }
 
 TEST_CASE("Index loading - invalid magic throws", "[genome_loader][index]") {
-    auto path = fs::temp_directory_path() / "cystidia_test_bad_magic.cy";
+    auto path = fs::temp_directory_path() / "stomata_test_bad_magic.st";
     {
         std::ofstream out(path, std::ios::binary);
         // Write invalid magic bytes
-        out.write("NOTCYSTI", 8);
+        out.write("NOTSTOMA", 8);
         // Pad to minimum header size
         char padding[56] = {0};
         out.write(padding, 56);
@@ -506,11 +506,11 @@ TEST_CASE("Index loading - invalid magic throws", "[genome_loader][index]") {
 }
 
 TEST_CASE("Index loading - truncated file throws", "[genome_loader][index]") {
-    auto path = fs::temp_directory_path() / "cystidia_test_truncated.cy";
+    auto path = fs::temp_directory_path() / "stomata_test_truncated.st";
     {
         std::ofstream out(path, std::ios::binary);
         // Write only partial header (less than 64 bytes)
-        out.write("CYSTIDIA\x00\x01\x00", 8);
+        out.write("STOMATA\x00\x01\x00", 8);
     }
 
     REQUIRE_THROWS_AS(load_genome_index(path.string()), std::runtime_error);
@@ -519,14 +519,14 @@ TEST_CASE("Index loading - truncated file throws", "[genome_loader][index]") {
 }
 
 TEST_CASE("Index loading - nonexistent file throws", "[genome_loader][index]") {
-    REQUIRE_THROWS_AS(load_genome_index("/nonexistent/path/missing.cy"),
+    REQUIRE_THROWS_AS(load_genome_index("/nonexistent/path/missing.st"),
                       std::runtime_error);
 }
 
 TEST_CASE("MappedGenome move semantics", "[genome_loader][index]") {
     // Load and create index
     Genome genome = load_fasta(SMALL_FASTA);
-    auto index_path = fs::temp_directory_path() / "cystidia_test_move.cy";
+    auto index_path = fs::temp_directory_path() / "stomata_test_move.st";
     write_genome_index(genome, index_path.string());
 
     // Load initial mapped genome

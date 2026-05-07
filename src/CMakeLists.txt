@@ -1,4 +1,4 @@
-# Cystidia library sources
+# Stomata library sources
 
 set(CPU_SOURCES
     bio_utils.cpp
@@ -14,11 +14,11 @@ set(CUDA_SOURCES
     gpu_engine.cu
 )
 
-add_library(cystidia ${CPU_SOURCES} ${CUDA_SOURCES})
-target_link_libraries(cystidia
+add_library(stomata ${CPU_SOURCES} ${CUDA_SOURCES})
+target_link_libraries(stomata
     PUBLIC CUDA::cudart Threads::Threads
     PRIVATE spdlog::spdlog ZLIB::ZLIB)
 
-add_executable(cystidia_cli main.cpp)
-target_link_libraries(cystidia_cli PRIVATE cystidia)
-set_target_properties(cystidia_cli PROPERTIES OUTPUT_NAME "cystidia")
+add_executable(stomata_cli main.cpp)
+target_link_libraries(stomata_cli PRIVATE stomata)
+set_target_properties(stomata_cli PROPERTIES OUTPUT_NAME "stomata")

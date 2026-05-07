@@ -10,7 +10,7 @@
 
 // Version
 
-static constexpr const char* CYSTIDIA_VERSION = "0.5.0";
+static constexpr const char* STOMATA_VERSION = "0.10.0";
 
 // Data structures
 
@@ -22,7 +22,7 @@ enum class Strand : char {
 
 // PAM position relative to the spacer.
 // Cas9 / Cas12 / base editors disagree on which side of the spacer the PAM sits;
-// Cystidia is PAM-agnostic, so the user specifies the position along with the pattern.
+// Stomata is PAM-agnostic, so the user specifies the position along with the pattern.
 enum class PamPosition : uint8_t {
     THREE_PRIME,  // PAM follows the spacer (e.g. SpCas9: 5'-[spacer]-NGG-3')
     FIVE_PRIME    // PAM precedes the spacer (e.g. Cas12a: 5'-TTTV-[spacer]-3')

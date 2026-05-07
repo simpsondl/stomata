@@ -49,7 +49,7 @@ TEST_CASE("SearchHit - comparison operators for sorting", "[search_pipeline][bas
 
 TEST_CASE("SearchConfig - default values", "[search_pipeline][config]") {
     SearchConfig config;
-    REQUIRE(config.threshold == 4);          // Default threshold for CRISPR
+    REQUIRE(config.threshold == 3);          // Default threshold (v0.6.1+: was 4)
     REQUIRE(config.prefer_gpu == true);      // Prefer GPU by default
     REQUIRE(config.pattern.empty());
 }

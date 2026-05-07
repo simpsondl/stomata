@@ -1,5 +1,5 @@
 #!/bin/bash
-# Prepare canonical chromosome hg38 reference for Cystidia validation testing
+# Prepare canonical chromosome hg38 reference for Stomata validation testing
 # Combines chr1-22, chrX, chrY, chrM into single multi-FASTA and compresses
 
 set -euo pipefail

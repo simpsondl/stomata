@@ -24,11 +24,11 @@ struct Genome {
     size_t total_bases;
 };
 
-// Memory-mapped genome index (.cy format)
+// Memory-mapped genome index (.st format)
 
-// Magic bytes: "CYSTIDIA" (8 bytes)
-constexpr char CYSTIDIA_INDEX_MAGIC[8] = {'C', 'Y', 'S', 'T', 'I', 'D', 'I', 'A'};
-constexpr uint64_t CYSTIDIA_INDEX_VERSION = 1;
+// Magic bytes: "STOMATA1" (8 bytes)
+constexpr char STOMATA_INDEX_MAGIC[8] = {'S', 'T', 'O', 'M', 'A', 'T', 'A', '1'};
+constexpr uint64_t STOMATA_INDEX_VERSION = 1;
 
 // Memory-mapped genome (points into mmap'd region, zero-copy access)
 struct MappedGenome {
@@ -71,15 +71,15 @@ struct GenomeView {
 GenomeView make_view(const Genome& genome);
 GenomeView make_view(const MappedGenome& genome);
 
-// Check if a filepath has the .cy extension.
-bool is_cystidia_index(const std::string& filepath);
+// Check if a filepath has the .st extension.
+bool is_stomata_index(const std::string& filepath);
 
-// Write a Genome to an .cy index file for fast memory-mapped loading.
+// Write a Genome to an .st index file for fast memory-mapped loading.
 // The file format includes a header, chromosome table, and contiguous bit-vectors.
 // Throws std::runtime_error if the file cannot be written.
 void write_genome_index(const Genome& genome, const std::string& filepath);
 
-// Load an .cy index file via memory mapping.
+// Load an .st index file via memory mapping.
 // Returns a MappedGenome with zero-copy access to bit-vectors.
 // Throws std::runtime_error if the file cannot be opened or is invalid.
 MappedGenome load_genome_index(const std::string& filepath);

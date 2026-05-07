@@ -57,6 +57,48 @@ TEST_CASE("CFD mismatch penalty - known values from Doench 2016", "[cfd][mismatc
     REQUIRE_THAT(cfd::get_mismatch_penalty(20, 'T', 'G'), WithinAbs(0.176, 0.01));
 }
 
+TEST_CASE("CFD matrix regression — cells that exposed the v0.7.0 transposition bug",
+          "[cfd][mismatch][regression]") {
+    // These cells were flipped in Stomata v0.6.5/v0.7.0 vs. the crisprScore
+    // reference. Ground-truth values taken from crisprScore::getCFDScores()
+    // (Bioconductor, commit state as of 2026-04-23). If any of these fail
+    // again the matrix has been corrupted — recheck against crisprScore.
+    REQUIRE_THAT(cfd::get_mismatch_penalty(3,  'C', 'A'), WithinAbs(0.866667, 0.001));
+    REQUIRE_THAT(cfd::get_mismatch_penalty(3,  'C', 'T'), WithinAbs(0.687500, 0.001));
+    REQUIRE_THAT(cfd::get_mismatch_penalty(4,  'A', 'G'), WithinAbs(0.625000, 0.001));
+    REQUIRE_THAT(cfd::get_mismatch_penalty(4,  'G', 'A'), WithinAbs(0.900000, 0.001));
+    REQUIRE_THAT(cfd::get_mismatch_penalty(5,  'C', 'T'), WithinAbs(0.636364, 0.001));
+    REQUIRE_THAT(cfd::get_mismatch_penalty(5,  'T', 'C'), WithinAbs(1.000000, 0.001));
+    REQUIRE_THAT(cfd::get_mismatch_penalty(6,  'A', 'G'), WithinAbs(0.714286, 0.001));
+    REQUIRE_THAT(cfd::get_mismatch_penalty(6,  'G', 'A'), WithinAbs(1.000000, 0.001));
+    REQUIRE_THAT(cfd::get_mismatch_penalty(13, 'C', 'G'), WithinAbs(0.136364, 0.001));
+    REQUIRE_THAT(cfd::get_mismatch_penalty(17, 'C', 'A'), WithinAbs(0.466667, 0.001));
+}
+
+TEST_CASE("CFD compound score — crisprScore reference pairs", "[cfd][score][regression]") {
+    // End-to-end CFD scores on five (spacer, protospacer, PAM) pairs.
+    // Ground-truth from crisprScore::getCFDScores(). Asymmetric purine- and
+    // pyrimidine-transition mismatches are included to catch the v0.6.5
+    // transposition bug in compound form.
+    struct Case {
+        std::string spacer;
+        std::string proto;
+        std::string pam;
+        double expected;
+    };
+    std::vector<Case> cases = {
+        {"GTCACCAATCCTGTCCCTAG", "GTCACCAATCCTGTCCCTAG", "AGG", 1.0000000},
+        {"GTCACCAATCCTGTCCCTAG", "GTAACCAATCCTGTCCATAG", "TGG", 0.4044444},
+        {"GTCACCAATCCTGTCCCTAG", "GCCACCAGTCCGGTCCCAAG", "CGG", 0.2095238},
+        {"GAGTCCGAGCAGAAGAAGAA", "GAGTCCGAGCAGAAGAAGAA", "AGG", 1.0000000},
+        {"GAGTCCGAGCAGAAGAAGAA", "GAGTCAGAGCAGAAGAAGAA", "AGG", 0.9285714},
+    };
+    for (const auto& c : cases) {
+        double actual = cfd::compute_cfd_score(c.spacer, c.proto, c.pam);
+        REQUIRE_THAT(actual, WithinAbs(c.expected, 0.001));
+    }
+}
+
 TEST_CASE("CFD mismatch penalty - seed vs distal region differences", "[cfd][mismatch]") {
     // Mismatches in seed region (positions 13-20) generally have lower penalties
     // than distal region (positions 1-12) for some mismatch types
