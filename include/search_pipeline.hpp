@@ -10,7 +10,7 @@
 
 // Version
 
-static constexpr const char* STOMATA_VERSION = "0.10.0";
+static constexpr const char* STOMATA_VERSION = "0.11.0";
 
 // Data structures
 

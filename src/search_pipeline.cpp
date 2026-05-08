@@ -1095,8 +1095,14 @@ SearchResult search_genome(const SearchConfig& config, GenomeView view) {
                 const size_t hi = pattern_len + pam_filter_threshold;
                 SearchHit best_hit;
                 bool have_best = false;
+                // Iterate every tl in the widening window. Don't skip
+                // tl == pattern_len: extract_mismatch_info sets pam_sequence
+                // from the canonical alignment's text_consumed, which can
+                // differ from pattern_len when traceback ties pick an
+                // alt-tl. The check we already failed at line 1085 is
+                // "PAM matches at text_consumed", not "PAM matches at
+                // pattern_len" — so pattern_len still needs to be tried.
                 for (size_t tl = lo; tl <= hi; ++tl) {
-                    if (tl == pattern_len) continue;
                     std::string candidate = read_pam_sequence(
                         view, h.genome_pos, h.strand, tl, config.pam);
                     if (!pam_matches_pattern(candidate, config.pam.pattern)) continue;
@@ -1671,10 +1677,18 @@ static BatchSearchResult search_genome_batch_gpu(
                     // alignment is valid AND whose PAM matches. We do
                     // this in two passes so we don't waste time on the
                     // expensive repopulate when a closer tl is around.
+                    //
+                    // Iterate every tl in the widening window. Don't skip
+                    // tl == pattern_len: extract_mismatch_info sets
+                    // pam_sequence from the canonical alignment's
+                    // text_consumed, which can differ from pattern_len
+                    // when traceback ties pick an alt-tl. The PAM check we
+                    // already failed at line 1657 is "matches at
+                    // text_consumed", not "matches at pattern_len" — so
+                    // pattern_len still needs to be tried.
                     SearchHit best_hit;
                     bool have_best = false;
                     for (size_t tl = lo; tl <= hi; ++tl) {
-                        if (tl == pattern_len) continue;
                         std::string candidate = read_pam_sequence(
                             view, h.genome_pos, h.strand, tl, config.pam);
                         if (candidate.size() < L) continue;

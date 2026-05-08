@@ -1,13 +1,15 @@
 # Stomata library sources
 
 set(CPU_SOURCES
+    annotation_bed.cpp
     bio_utils.cpp
+    cfd_scorer.cpp
     genome_loader.cpp
     myers_cpu.cpp
-    shift_add_cpu.cpp
-    verifier.cpp
     search_pipeline.cpp
-    cfd_scorer.cpp
+    shift_add_cpu.cpp
+    spacer_summary.cpp
+    verifier.cpp
 )
 
 set(CUDA_SOURCES

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(Stomata VERSION 0.10.0 LANGUAGES CXX CUDA)
+project(Stomata VERSION 0.11.0 LANGUAGES CXX CUDA)
 
 # C++17 required
 # Use explicit compiler flags for C++ to avoid CMake's feature-mapping
