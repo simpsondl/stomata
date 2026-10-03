@@ -8,12 +8,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y cmake ninja-build g++ libspdlog-dev zlib1g-dev catch2
-      - run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTOMATA_ENABLE_CUDA=OFF -DSTOMATA_BUILD_VALIDATION=ON
+      - run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTOMATA_ENABLE_CUDA=OFF
       - run: cmake --build build -j 2
       - run: ctest --test-dir build --output-on-failure
       - run: build/src/stomata --quickstart --cpu-only
-      - run: python3 -m unittest discover -s validation/benchmarks/tests
-      - run: python3 -m compileall -q tests/oracle validation scripts
+      - run: python3 tests/oracle/check_fixture.py --binary build/src/stomata --cpu-only
+      - run: python3 -m compileall -q tests/oracle scripts
   container:
     runs-on: ubuntu-24.04
     steps:

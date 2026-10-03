@@ -62,10 +62,7 @@ Spacer files accept a sequence per line or `name<TAB>sequence`. Use
 
 - [User guide](docs/USER_GUIDE.md): flags, formats, coordinates and examples
 - [Installation and testing](docs/INSTALL.md): builds, CPU-only option, containers, tests
-- [Validation](validation/README.md): independent DP oracle and fuzzing, cross-tool and
-  biological evaluations
-- [Benchmarks and plot](validation/benchmarks/README.md): four search scopes,
-  recorded commands, input hashes and repeated measurements
+- [Correctness checks](tests/oracle/README.md): independent DP oracle and fuzzing
 - [Changelog](CHANGELOG.md) - [Citation](CITATION.cff)
 
 Issues and reproducible bug reports: <https://github.com/simpsondl/stomata/issues>.

@@ -39,7 +39,7 @@ dependency is an error rather than a successful build with no tests. Use
 For CUDA, omit `-DSTOMATA_ENABLE_CUDA=OFF`, run CTest on a GPU host, and run
 `build/src/stomata --quickstart`. Confirm the smoke-test rows say `[GPU]`;
 a CPU fallback is not a GPU validation result. The independent oracle and fuzz
-checks are described in [validation/README.md](../validation/README.md).
+checks are described in [tests/oracle/README.md](../tests/oracle/README.md).
 
 ## Container
 
@@ -55,7 +55,7 @@ docker run --gpus all --rm -v "$PWD:/work" stomata:local --genome /work/hg38.fa.
 
 Docker GPU use requires NVIDIA Container Toolkit on the host. The final image
 contains the CLI and runtime dependencies; the larger `build` stage contains
-tests and evaluation sources. To test on a GPU:
+tests and source code. To test on a GPU:
 
 ```bash
 docker build --target build -t stomata-build:local .

@@ -2,7 +2,6 @@ cmake_minimum_required(VERSION 3.20)
 project(Stomata VERSION 1.0.0 LANGUAGES CXX)
 
 option(STOMATA_ENABLE_CUDA "Build NVIDIA GPU acceleration" ON)
-option(STOMATA_BUILD_VALIDATION "Build optional cross-tool and biological evaluation tools" OFF)
 include(CTest)
 
 # C++17 required
@@ -45,9 +44,5 @@ include_directories(include)
 add_subdirectory(src)
 if(BUILD_TESTING)
     add_subdirectory(tests)
-endif()
-# Optional evaluation tools, built only when the validation/ tree is present.
-if(STOMATA_BUILD_VALIDATION AND EXISTS "${CMAKE_SOURCE_DIR}/validation/CMakeLists.txt")
-    add_subdirectory(validation)
 endif()
 

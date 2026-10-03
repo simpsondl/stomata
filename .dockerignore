@@ -2,6 +2,6 @@
 .cache
 build*
 **/__pycache__
-validation/results
-validation/data
+tests/oracle/results
+tests/oracle/failures
 *.st

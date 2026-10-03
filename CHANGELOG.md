@@ -16,11 +16,8 @@ First stable release.
 - Per-hit TSV, BED or JSON with coordinates, strand, alignment, CIGAR and PAM.
 - CFD scores, per-guide summaries with aggregate CFD, and BED overlap counts.
 
-**Validation**
+**Testing**
 - Unit and CLI integration tests (CTest), run in CI for the CPU build and the
   container image.
 - Independent dynamic-programming oracle with fixtures, and randomized fuzz
   comparisons against it on both the CPU and GPU paths.
-- Cross-tool comparisons with Cas-OFFinder and SWOffinder, and recovery of
-  experimentally observed CHANGE-seq and GUIDE-seq sites
-  (see [validation/](validation/README.md)).

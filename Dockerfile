@@ -10,7 +10,6 @@ ARG CUDA_ARCHITECTURES="70;75;80;86;89;90"
 ARG BUILD_JOBS=2
 RUN cmake -S . -B build-container -G Ninja -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHITECTURES}" \
-      -DSTOMATA_BUILD_VALIDATION=ON \
     && cmake --build build-container -j "${BUILD_JOBS}"
 
 FROM compile AS build

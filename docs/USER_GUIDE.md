@@ -437,12 +437,6 @@ and GPU transfer still take time. Use `.st` when reusing a reference.
 ./build/src/stomata --genome hg38.fa.st ...    # all later runs
 ```
 
-### Reproducible benchmarks
-
-Historical timing tables were removed because their raw measurements are not
-available in this checkout. Use the [benchmark runner](../validation/benchmarks/README.md)
-to record versions, hardware, hashes, repeated timings and failures.
-
 ### Tips
 
 - **Use `.st` indices** for repeated searches.
@@ -629,8 +623,8 @@ The search scans the supplied reference within the selected distance threshold.
 Levenshtein output is halo-deduplicated by default; use `--no-deduplicate`
 when every raw end-position is required. Hit caps deliberately truncate output.
 Record the version, reference/guide hashes, flags and CPU/GPU path.
-See [testing](INSTALL.md#testing) and [validation](../validation/README.md) for
-reproducible checks and their limits. Candidate sequence matches are not
+See [testing](INSTALL.md#testing) and [oracle checks](../tests/oracle/README.md) for
+reproducible correctness checks and their limits. Candidate sequence matches are not
 experimental measurements of cleavage.
 
 ---

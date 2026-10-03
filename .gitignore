@@ -11,8 +11,7 @@ build-*/
 __pycache__/
 *.pyc
 .venv/
-validation/results/
-validation/data/
+tests/oracle/results/
 tests/oracle/failures/
 *.st
 *.log

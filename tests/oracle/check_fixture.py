@@ -15,7 +15,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--binary", type=Path, default=ROOT / "build/src/stomata")
     ap.add_argument("--cpu-only", action="store_true")
-    ap.add_argument("--output-dir", type=Path, default=ROOT / "validation/results/oracle")
+    ap.add_argument("--output-dir", type=Path, default=ROOT / "tests/oracle/results")
     args = ap.parse_args()
     binary = str(args.binary.resolve())
     args.output_dir.mkdir(parents=True, exist_ok=True)
