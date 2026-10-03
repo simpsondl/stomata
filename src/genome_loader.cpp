@@ -71,7 +71,9 @@ static std::string decompress_gzip(const std::string& filepath) {
         strm.next_out  = reinterpret_cast<Bytef*>(buffer.data());
         strm.avail_out = static_cast<uInt>(buffer.size());
         ret = inflate(&strm, Z_NO_FLUSH);
-        if (ret == Z_STREAM_ERROR || ret == Z_DATA_ERROR || ret == Z_MEM_ERROR) {
+        // Incomplete input eventually returns Z_BUF_ERROR: retrying cannot
+        // make progress because the entire compressed file is already supplied.
+        if (ret != Z_OK && ret != Z_STREAM_END) {
             inflateEnd(&strm);
             throw std::runtime_error("gzip decompression failed for: " + filepath);
         }

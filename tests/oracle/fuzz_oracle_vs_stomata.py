@@ -18,10 +18,10 @@ Output:
   - End-of-run summary.
 
 Usage:
-  python3 scripts/fuzz_oracle_vs_stomata.py \\
+  python3 tests/oracle/fuzz_oracle_vs_stomata.py \\
       --num-configs 500 \\
       --seed-start 1 \\
-      --out-dir tests/regression/fuzz_failures/ \\
+      --out-dir tests/oracle/failures/ \\
       --stomata-bin build/src/stomata
 
 Run overnight. Each config takes ~5-30 s (oracle bound). 500 configs

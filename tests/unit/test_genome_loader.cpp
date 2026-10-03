@@ -319,6 +319,28 @@ TEST_CASE("gzip FASTA parsing - corrupt .gz file throws",
     REQUIRE_THROWS_AS(parse_fasta(path.string()), std::runtime_error);
 }
 
+TEST_CASE("gzip FASTA parsing - truncated input throws",
+          "[genome_loader][fasta][gzip]") {
+    std::ifstream input(SMALL_FASTA_GZ, std::ios::binary);
+    REQUIRE(input.is_open());
+    const std::string compressed((std::istreambuf_iterator<char>(input)),
+                                std::istreambuf_iterator<char>());
+    REQUIRE(compressed.size() > 18);
+    // Empty input, partial header, partial payload, and missing trailer bytes.
+    for (const size_t length : {size_t{0}, size_t{5}, compressed.size() / 2,
+                               compressed.size() - 4, compressed.size() - 1}) {
+        CAPTURE(length);
+        auto path = fs::temp_directory_path() / "stomata_test_truncated.fa.gz";
+        {
+            std::ofstream out(path, std::ios::binary);
+            REQUIRE(out.is_open());
+            out.write(compressed.data(), static_cast<std::streamsize>(length));
+        }
+        CHECK_THROWS_AS(parse_fasta(path.string()), std::runtime_error);
+        fs::remove(path);
+    }
+}
+
 TEST_CASE("gzip load_fasta - end-to-end produces same Genome as plain",
           "[genome_loader][integration][gzip]") {
     Genome plain = load_fasta(SMALL_FASTA);
