@@ -5,13 +5,6 @@ type: software
 authors:
   - given-names: Danny
     family-names: Simpson
-    affiliation: "New York Genome Center"
-  - given-names: Neville E.
-    family-names: Sanjana
-    affiliation: "New York Genome Center"
-  - given-names: Tuuli
-    family-names: Lappalainen
-    affiliation: "New York Genome Center"
 license: MIT
 version: 1.0.0
 date-released: 2026-10-03

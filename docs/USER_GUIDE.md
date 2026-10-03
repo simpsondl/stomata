@@ -633,13 +633,17 @@ experimental measurements of cleavage.
 
 ```bibtex
 @software{Stomata2026,
-  author  = {Simpson, Danny and Sanjana, Neville E. and Lappalainen, Tuuli},
+  author  = {Simpson, Danny},
   title   = {Stomata: GPU-accelerated exhaustive CRISPR off-target search},
   year    = {2026},
   version = {1.0.0},
   url     = {https://github.com/simpsondl/stomata}
 }
 ```
+
+## Acknowledgments
+
+Development of Stomata was initiated while the author was at the New York Genome Center.
 
 ## License
 
@@ -653,4 +657,4 @@ MIT — see [LICENSE](../LICENSE).
 ---
 
 **Version:** 1.0.0
-**Authors:** Danny Simpson, Neville E. Sanjana, Tuuli Lappalainen (New York Genome Center)
+**Author:** Danny Simpson
