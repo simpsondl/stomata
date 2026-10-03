@@ -43,6 +43,34 @@ checks are described in [tests/oracle/README.md](../tests/oracle/README.md).
 
 ## Container
 
+The published release image is `ghcr.io/simpsondl/stomata:v1.0.0` (Linux x86_64).
+No registry login is required.
+
+```bash
+docker pull ghcr.io/simpsondl/stomata:v1.0.0
+docker run --rm ghcr.io/simpsondl/stomata:v1.0.0 --quickstart --cpu-only
+docker run --gpus all --rm ghcr.io/simpsondl/stomata:v1.0.0 --quickstart
+docker run --gpus all --rm -v "$PWD:/work" ghcr.io/simpsondl/stomata:v1.0.0 --genome /work/hg38.fa.st --spacer-file /work/guides.tsv --threshold 3 --pam NGG --output /work/hits.tsv
+```
+
+For reproducible runs, replace the tag with the verified release digest:
+
+```text
+ghcr.io/simpsondl/stomata@sha256:3a46049e61cfb67b68b9ac335c19fb5d2c88ef86ad08913349bc557de404f32b
+```
+
+This image passed all four quickstart cases on CPU and on an NVIDIA GTX 1660
+SUPER. The source tests and independent oracle checks are described above.
+
+For Apptainer:
+
+```bash
+apptainer pull stomata-1.0.0.sif docker://ghcr.io/simpsondl/stomata:v1.0.0
+apptainer run --nv stomata-1.0.0.sif --quickstart
+```
+
+### Build the container locally
+
 The Dockerfile builds against CUDA 12.6.3 / Ubuntu 24.04 and runs the C++ tests
 and CPU smoke test during build. Building an image does not exercise a GPU.
 
@@ -69,6 +97,3 @@ docker save stomata:local -o stomata.tar
 apptainer build stomata.sif docker-archive://stomata.tar
 apptainer run --nv stomata.sif --quickstart
 ```
-
-No public image tag is claimed until a release image has actually been pushed.
-Pin a release digest when adopting a published image in a workflow.

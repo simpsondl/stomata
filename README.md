@@ -16,6 +16,16 @@ on NVIDIA GPUs; a CPU-only build is also available.
 
 ## Install and try it
 
+Run the published Linux x86_64 container without building from source:
+
+```bash
+docker run --rm ghcr.io/simpsondl/stomata:v1.0.0 --quickstart --cpu-only
+```
+
+For NVIDIA GPU execution, add `--gpus all` and omit `--cpu-only`.
+See [installation](docs/INSTALL.md#container) for reference mounts, pinned
+image digests, and Apptainer.
+
 On Ubuntu 24.04, the CPU build needs no CUDA toolkit:
 
 ```bash
