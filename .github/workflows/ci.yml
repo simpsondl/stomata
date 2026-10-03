@@ -6,7 +6,7 @@ jobs:
   cpu:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - run: sudo apt-get update && sudo apt-get install -y cmake ninja-build g++ libspdlog-dev zlib1g-dev catch2
       - run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTOMATA_ENABLE_CUDA=OFF
       - run: cmake --build build -j 2
@@ -17,6 +17,6 @@ jobs:
   container:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - run: docker build --build-arg CUDA_ARCHITECTURES=75 -t stomata:ci .
       - run: docker run --rm stomata:ci --quickstart --cpu-only
