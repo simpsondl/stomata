@@ -1,0 +1,7 @@
+.git
+.cache
+build*
+**/__pycache__
+validation/results
+validation/data
+*.st

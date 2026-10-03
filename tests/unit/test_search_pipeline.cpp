@@ -484,6 +484,75 @@ TEST_CASE("search_genome_batch - parallel produces same results as sequential",
     REQUIRE(seq_result.total_hits == par_result.total_hits);
 }
 
+// Regression: the threaded CPU worker didn't forward distance_mode, so
+// Hamming batches with >1 thread silently ran as Levenshtein.
+TEST_CASE("search_genome_batch - parallel Hamming matches sequential hit-for-hit",
+          "[search_pipeline][parallel][distance_mode]") {
+    Genome genome = load_fasta(kTestSmallFa);
+
+    BatchSearchConfig sequential_config;
+    sequential_config.spacers = {
+        {"spacer_1", "ACGTACGT"},
+        {"spacer_2", "GCTAGCTA"},
+        {"spacer_3", "TTTTAAAA"},
+    };
+    sequential_config.threshold = 2;
+    sequential_config.distance_mode = DistanceMode::HAMMING;
+    sequential_config.prefer_gpu = false;
+    sequential_config.num_threads = 1;
+
+    BatchSearchConfig parallel_config = sequential_config;
+    parallel_config.num_threads = 4;
+
+    BatchSearchConfig lev_config = parallel_config;
+    lev_config.distance_mode = DistanceMode::LEVENSHTEIN;
+
+    auto seq_result = search_genome_batch(sequential_config, genome);
+    auto par_result = search_genome_batch(parallel_config, genome);
+    auto lev_result = search_genome_batch(lev_config, genome);
+
+    // Guard: the fixture must actually distinguish the two modes.
+    REQUIRE(lev_result.total_hits != seq_result.total_hits);
+
+    REQUIRE(seq_result.spacer_results.size() == par_result.spacer_results.size());
+    for (size_t i = 0; i < seq_result.spacer_results.size(); ++i) {
+        const auto& s = seq_result.spacer_results[i].result.hits;
+        const auto& p = par_result.spacer_results[i].result.hits;
+        REQUIRE(s.size() == p.size());
+        for (size_t k = 0; k < s.size(); ++k) {
+            REQUIRE(s[k].genome_pos == p[k].genome_pos);
+            REQUIRE(s[k].strand == p[k].strand);
+            REQUIRE(s[k].distance == p[k].distance);
+            // Hamming alignments never contain gaps.
+            REQUIRE(p[k].mismatch_info.cigar.find_first_of("ID") == std::string::npos);
+        }
+    }
+}
+
+// Regression: an invalid spacer threw out of a CPU worker thread
+// (std::terminate) instead of being skipped like the other batch paths.
+TEST_CASE("search_genome_batch - parallel CPU path skips invalid spacers",
+          "[search_pipeline][parallel][error]") {
+    Genome genome = load_fasta(kTestSmallFa);
+
+    BatchSearchConfig config;
+    config.spacers = {
+        {"good_1", "ACGTACGT"},
+        {"bad",    "ACGTXCGT"},
+        {"good_2", "GCTAGCTA"},
+    };
+    config.threshold = 1;
+    config.prefer_gpu = false;
+    config.num_threads = 4;
+
+    BatchSearchResult result;
+    REQUIRE_NOTHROW(result = search_genome_batch(config, genome));
+    REQUIRE(result.spacers_skipped == 1);
+    REQUIRE(result.spacer_results.size() == 2);
+    REQUIRE(result.spacer_results[0].spacer_name == "good_1");
+    REQUIRE(result.spacer_results[1].spacer_name == "good_2");
+}
+
 TEST_CASE("search_genome_batch - empty spacer list", "[search_pipeline][parallel]") {
     Genome genome = load_fasta(kTestSmallFa);
 
@@ -989,4 +1058,39 @@ TEST_CASE("search_genome - Hamming mode works with forward_only", "[search_pipel
     for (const auto& hit : result.hits) {
         REQUIRE(hit.strand == Strand::PLUS);
     }
+}
+
+// Regression (fuzz seed 5): an exact spacer match whose adjacent 5' PAM fails
+// (GGA vs NRG) while a 1-base-wider target has a matching PAM (AGG). The Lev
+// PAM pre-filter stored the wider window's PAM, and the d=0 mismatch fast path
+// kept it, so the hit was reported as distance 0 / 18M with PAM AGG. The only
+// PAM-valid alignment ending there costs 1 (DNA bulge on the extra A).
+TEST_CASE("search_genome - d=0 hit does not inherit PAM from a shifted target length",
+          "[search_pipeline][pam][levenshtein]") {
+    const std::string spacer = "TATACTCACGACGCCAGT";
+    const std::string seq = "GTCAGTAGGA" + spacer + "GCCAATTTAAAG";
+    auto genome = encode_genome({{"chr1", seq}});
+
+    SearchConfig config;
+    config.pattern = spacer;
+    config.threshold = 4;
+    config.distance_mode = DistanceMode::LEVENSHTEIN;
+    config.pam.pattern = "NRG";
+    config.pam.position = PamPosition::FIVE_PRIME;
+    config.forward_only = true;
+    config.prefer_gpu = false;
+
+    auto result = search_genome(config, genome);
+
+    const size_t spacer_end = 10 + spacer.size() - 1;
+    bool found_end = false;
+    for (const auto& hit : result.hits) {
+        REQUIRE(hit.distance > 0);
+        if (hit.genome_pos == spacer_end) {
+            found_end = true;
+            REQUIRE(hit.distance == 1);
+            REQUIRE(hit.mismatch_info.pam_sequence == "AGG");
+        }
+    }
+    REQUIRE(found_end);
 }

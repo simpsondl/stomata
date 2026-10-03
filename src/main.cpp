@@ -453,6 +453,14 @@ static bool validate_arguments(const Arguments& args) {
         return false;
     }
 
+    if ((args.summary_mode || !args.spacer_summary_path.empty()) &&
+        (args.max_hits > 0 || args.max_total_hits > 0)) {
+        std::cerr << "Error: hit caps cannot be combined with --summary or "
+                     "--spacer-summary: truncated hits would undercount totals "
+                     "and activity scores. Remove the caps for complete summaries.\n";
+        return false;
+    }
+
     return true;
 }
 
@@ -762,6 +770,7 @@ static std::string run_batch_search(const Arguments& args, GenomeView view,
     batch_config.reverse_only = reverse_only_for(args.strand_mode);
     batch_config.verbose = args.verbose;
     batch_config.num_threads = args.num_threads;
+    batch_config.disable_deduplication = args.disable_deduplication;
     batch_config.search_start = region_start;
     batch_config.search_end   = region_end;
     batch_config.distance_mode = distance_mode_from_string(args.distance_mode);

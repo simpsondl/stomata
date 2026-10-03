@@ -1,0 +1,21 @@
+name: Bug report
+description: A build failure, crash, or unexpected result
+body:
+  - type: textarea
+    attributes:
+      label: What happened?
+      description: Include the expected result and what Stomata returned.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Reproducer
+      description: Exact command and a small synthetic input if possible; include stderr.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Environment
+      description: Stomata version/commit, OS, install method, GPU/driver, and whether --cpu-only reproduces it.
+    validations:
+      required: true

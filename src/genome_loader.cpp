@@ -89,6 +89,9 @@ static std::vector<FastaEntry> parse_fasta_stream(std::istream& in) {
     std::string line;
 
     while (std::getline(in, line)) {
+        // getline removes LF but preserves CR in Windows-authored FASTA files.
+        // Normalize the line ending before parsing names or sequence bases.
+        if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line.empty() || line[0] == ';') {
             continue;   // skip blank lines and comments
         }

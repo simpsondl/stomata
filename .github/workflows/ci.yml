@@ -1,0 +1,22 @@
+name: Build and test
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  cpu:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y cmake ninja-build g++ libspdlog-dev zlib1g-dev catch2
+      - run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTOMATA_ENABLE_CUDA=OFF -DSTOMATA_BUILD_VALIDATION=ON
+      - run: cmake --build build -j 2
+      - run: ctest --test-dir build --output-on-failure
+      - run: build/src/stomata --quickstart --cpu-only
+      - run: python3 -m unittest discover -s validation/benchmarks/tests
+      - run: python3 -m compileall -q tests/oracle validation scripts
+  container:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build --build-arg CUDA_ARCHITECTURES=75 -t stomata:ci .
+      - run: docker run --rm stomata:ci --quickstart --cpu-only

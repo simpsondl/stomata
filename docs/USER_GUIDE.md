@@ -20,6 +20,8 @@ Complete guide to using Stomata for exhaustive CRISPR off-target search.
 
 ## Installation
 
+See [installation](INSTALL.md) for the CPU-only build and container.
+
 ### System Requirements
 
 - **Operating System:** Linux (tested on Ubuntu 20.04+)
@@ -32,7 +34,7 @@ Complete guide to using Stomata for exhaustive CRISPR off-target search.
 
 - CMake ≥3.20
 - C++17 compiler (GCC 11+ or Clang 14+)
-- CUDA Toolkit 11.8+ (only for GPU build; the binary still runs on CPU if no GPU is present)
+- CUDA Toolkit 11.8+ for a GPU build; omit it with `-DSTOMATA_ENABLE_CUDA=OFF`
 - spdlog, zlib, Catch2 (Catch2 only for the test suite)
 
 ### Build (conda recommended)
@@ -71,7 +73,7 @@ on your hardware.
 
 ```bash
 ./build/src/stomata \
-  --genome tests/data/synthetic/genome.fa \
+  --genome tests/data/synthetic/test_small.fa \
   --pattern GAGTCCGAGCAGAAGAAGAA \
   --threshold 3
 ```
@@ -189,7 +191,7 @@ entirely.
 Stomata does PAM filtering by IUPAC pattern matching, not by named tier.
 The PAM is extracted from the genome and matched against `--pam`; the
 search itself does not constrain on PAM, so the same search can be
-re-filtered post hoc by re-running with a different `--pam`.
+filtered from saved annotated output. Re-running the CLI with another `--pam` performs a new search.
 
 ### Pattern syntax
 
@@ -427,23 +429,19 @@ capability ≥7.0). Pass `--cpu-only` to force CPU. Patterns longer than
 
 ### Indices
 
-The `.st` index is memory-mapped, so subsequent loads are effectively
-instant after the first page-in. Always work from `.st` if you'll reuse
-the genome.
+The `.st` index is memory-mapped on the host. Mapping is cheap, but page-in
+and GPU transfer still take time. Use `.st` when reusing a reference.
 
 ```bash
 ./build/src/stomata --index-genome hg38.fa     # produces hg38.fa.st (one-time)
 ./build/src/stomata --genome hg38.fa.st ...    # all later runs
 ```
 
-### Reference benchmarks (hg38, 225 spacers, threshold 3, search-only)
+### Reproducible benchmarks
 
-| Tool | Config | Runtime |
-|------|--------|---------|
-| Stomata | `--distance-mode hamming` | **38.1 s** |
-| Stomata | `--distance-mode levenshtein` (default) | 47.9 s |
-| Cas-OFFinder | NGG prefilter | 21.2 s |
-| Cas-OFFinder | PAM-agnostic (all-N) | crashes (`CL_OUT_OF_RESOURCES`) |
+Historical timing tables were removed because their raw measurements are not
+available in this checkout. Use the [benchmark runner](../validation/benchmarks/README.md)
+to record versions, hardware, hashes, repeated timings and failures.
 
 ### Tips
 
@@ -458,6 +456,9 @@ the genome.
 
 ### Memory
 
+Historical planning estimates below are not current build measurements.
+Peak memory also depends on hit density and batch size.
+
 | Genome | CPU memory | GPU VRAM |
 |--------|------------|----------|
 | E. coli (4.6 Mb) | <100 MB | <50 MB |
@@ -471,11 +472,11 @@ the genome.
 - **Default threshold is 3.** Pass `--threshold N` explicitly if you care.
 - **Default PAM filter is none.** Without `--pam`, every sequence match
   is reported regardless of PAM context. PAM is annotation, not a search
-  constraint — re-running with a different `--pam` re-filters without
-  re-searching the genome.
+  constraint — filter saved annotated output to avoid another search. Re-running the CLI performs a new search.
 - **PAM-agnostic output is large.** On hg38 at threshold 3, 225 spacers
   produces ~4M hits with no PAM filter vs ~280K with `--pam NGG`. Use
-  `--max-hits`, `--max-total-hits`, or `--summary`.
+  `--summary` to reduce output volume. Hit caps truncate results after search;
+  they do not guarantee lower peak memory and cannot be combined with summaries.
 - **U → T normalization is on by default.** RNA spacers work as-is.
   Disable with `--no-treat-u-as-t` for strict validation.
 - **Pattern N matches any base at zero cost; genome N is masked
@@ -527,8 +528,8 @@ toolkit you built against, and that the GPU's compute capability is in
 the SASS targets the binary was built with.
 
 **`std::bad_alloc` / out of memory**
-Lower `--threshold`, add `--pam`, cap with `--max-hits` /
-`--max-total-hits`, or split with `--region`.
+Lower `--threshold`, add `--pam`, or split into smaller batches or regions.
+Hit caps and summary formatting are not peak-memory limits.
 
 ### Performance issues
 
@@ -575,14 +576,13 @@ single-spacer / small genome runs.
   --spacer-file my_library.txt \
   --threshold 3 \
   --pam NGG \
-  --max-hits 5000 \
   --output library_offtargets.tsv \
   --spacer-summary library_summary.tsv \
   --intersect-bed CDS:annotations/cds.bed
 ```
 
-`library_summary.tsv` will rank guides by aCFD and flag promiscuous
-candidates; the new `n_CDS_overlaps` column counts off-targets that fall
+`library_summary.tsv` reports aCFD and flags promiscuous
+candidates; sort it explicitly to rank guides; the new `n_CDS_overlaps` column counts off-targets that fall
 in coding regions per guide.
 
 ### 4. Cas12a (5'-PAM, TTTV)
@@ -625,10 +625,13 @@ ngg.sort_values("cfd_score", ascending=False).head(20).to_csv(
 
 ## Reproducibility
 
-- **100 % sensitivity within threshold:** Stomata is exhaustive; every
-  position is evaluated.
-- **Bit-identical results:** Same input → same output, run-to-run.
-- **No heuristics or seed indexing.**
+The search scans the supplied reference within the selected distance threshold.
+Levenshtein output is halo-deduplicated by default; use `--no-deduplicate`
+when every raw end-position is required. Hit caps deliberately truncate output.
+Record the version, reference/guide hashes, flags and CPU/GPU path.
+See [testing](INSTALL.md#testing) and [validation](../validation/README.md) for
+reproducible checks and their limits. Candidate sequence matches are not
+experimental measurements of cleavage.
 
 ---
 
@@ -639,7 +642,7 @@ ngg.sort_values("cfd_score", ascending=False).head(20).to_csv(
   author  = {Simpson, Danny and Sanjana, Neville E. and Lappalainen, Tuuli},
   title   = {Stomata: GPU-accelerated exhaustive CRISPR off-target search},
   year    = {2026},
-  version = {0.10.0},
+  version = {0.11.0},
   url     = {https://github.com/simpsondl/stomata}
 }
 ```
@@ -655,5 +658,5 @@ MIT — see [LICENSE](../LICENSE).
 
 ---
 
-**Version:** 0.10.0
+**Version:** 0.11.0
 **Authors:** Danny Simpson, Neville E. Sanjana, Tuuli Lappalainen (New York Genome Center)

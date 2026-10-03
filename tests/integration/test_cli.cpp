@@ -880,3 +880,14 @@ TEST_CASE("CLI - spacer-file dash reads spacers from stdin", "[cli][batch][stdin
     REQUIRE(result.exit_code == 0);
     REQUIRE(result.stdout_text.find("stdin_spacer") != std::string::npos);
 }
+
+TEST_CASE("CLI - summaries reject truncation", "[cli][summary]") {
+    for (const auto& summary : {"--summary", "--spacer-summary /tmp/unused-summary.tsv"}) {
+        for (const auto& cap : {"--max-hits 1", "--max-total-hits 1"}) {
+            auto result = run_command(kStomataExe + " --pattern ACGT --genome " +
+                                      kTestSmallFa + " " + summary + " " + cap);
+            REQUIRE(result.exit_code != 0);
+            REQUIRE(result.stderr_text.find("truncated hits would undercount") != std::string::npos);
+        }
+    }
+}

@@ -825,10 +825,11 @@ static void extract_mismatch_info(const std::string& original_pattern,
         ? reverse_complement(genome_seq) : genome_seq;
 
     if (hit.distance == 0) {
-        // No bulges possible → target length == pattern length.
-        if (hit.mismatch_info.pam_sequence.empty()) {
-            extract_pam_bases(view, hit, m, pam_spec);
-        }
+        // No bulges possible → target length == pattern length. Always
+        // re-read: the Lev PAM pre-filter may have stored a PAM from a
+        // shifted target length, which would let the post-filter keep a
+        // d=0 hit whose adjacent PAM doesn't actually match.
+        extract_pam_bases(view, hit, m, pam_spec);
         hit.mismatch_info.aligned_sequence =
             extract_aligned_region_perfect_match(compare_sequence, hit.strand, m);
         hit.mismatch_info.cigar = std::to_string(m) + "M";
@@ -1367,6 +1368,29 @@ std::vector<SpacerEntry> parse_spacer_file(const std::string& filepath) {
     return spacers;
 }
 
+// Per-spacer SearchConfig for the CPU batch paths. Shared by the sequential
+// and threaded paths so a new BatchSearchConfig field can't reach one but not
+// the other (that drift once silently ran threaded Hamming as Levenshtein).
+static SearchConfig make_spacer_config(const BatchSearchConfig& config,
+                                       const SpacerEntry& spacer) {
+    SearchConfig single_config;
+    single_config.pattern = spacer.sequence;
+    single_config.threshold = config.threshold;
+    single_config.distance_mode = config.distance_mode;
+    single_config.prefer_gpu = config.prefer_gpu;
+    single_config.search_both_strands = config.search_both_strands;
+    single_config.forward_only = config.forward_only;
+    single_config.reverse_only = config.reverse_only;
+    single_config.compute_mismatches = config.compute_mismatches;
+    single_config.compute_scores = config.compute_scores;
+    single_config.pam = config.pam;
+    single_config.max_hits = config.max_hits_per_spacer;
+    single_config.disable_deduplication = config.disable_deduplication;
+    single_config.search_start = config.search_start;
+    single_config.search_end = config.search_end;
+    return single_config;
+}
+
 // Compute MIT specificity scores for all spacers in a batch result.
 // This aggregates CFD scores across all off-targets for each spacer.
 // Sequential batch search implementation (used for single spacer or num_threads=1)
@@ -1404,21 +1428,7 @@ static BatchSearchResult search_genome_batch_sequential(
             continue;  // Skip this spacer, continue with next
         }
 
-        // Build SearchConfig for this spacer
-        SearchConfig single_config;
-        single_config.pattern = spacer.sequence;
-        single_config.threshold = config.threshold;
-        single_config.prefer_gpu = config.prefer_gpu;
-        single_config.search_both_strands = config.search_both_strands;
-        single_config.forward_only = config.forward_only;
-        single_config.reverse_only = config.reverse_only;
-        single_config.compute_mismatches = config.compute_mismatches;
-        single_config.compute_scores = config.compute_scores;
-        single_config.pam = config.pam;
-        single_config.max_hits = config.max_hits_per_spacer;
-        single_config.distance_mode = config.distance_mode;
-        single_config.search_start = config.search_start;
-        single_config.search_end = config.search_end;
+        SearchConfig single_config = make_spacer_config(config, spacer);
 
         // Reuse existing search_genome function
         SearchResult result = search_genome(single_config, view);
@@ -1808,8 +1818,29 @@ BatchSearchResult search_genome_batch(const BatchSearchConfig& config,
 
     auto start_time = std::chrono::high_resolution_clock::now();
 
+    // Validate up front, in input order, so warnings are deterministic and an
+    // invalid spacer can't throw out of a worker thread (std::terminate).
+    std::vector<size_t> valid_spacer_indices;
+    valid_spacer_indices.reserve(num_spacers);
+    for (size_t i = 0; i < num_spacers; ++i) {
+        const auto& spacer = config.spacers[i];
+        try {
+            validate_pattern(spacer.sequence);
+        } catch (const std::invalid_argument& e) {
+            std::cerr << "Warning: Skipping spacer '" << spacer.name << "'";
+            if (!spacer.source_file.empty() && spacer.source_line > 0) {
+                std::cerr << " (" << spacer.source_file << ":" << spacer.source_line << ")";
+            }
+            std::cerr << ": " << e.what() << "\n";
+            batch_result.spacers_skipped++;
+            continue;
+        }
+        valid_spacer_indices.push_back(i);
+    }
+    const size_t num_valid = valid_spacer_indices.size();
+
     // Pre-allocate results vector with correct size (preserves ordering)
-    batch_result.spacer_results.resize(num_spacers);
+    batch_result.spacer_results.resize(num_valid);
 
     // Synchronization primitives
     std::mutex gpu_mutex;           // Serialize GPU access
@@ -1825,22 +1856,11 @@ BatchSearchResult search_genome_batch(const BatchSearchConfig& config,
         while (true) {
             // Fetch next work item (atomic increment = work stealing)
             size_t i = next_index.fetch_add(1);
-            if (i >= num_spacers) break;  // No more work
+            if (i >= num_valid) break;  // No more work
 
-            const auto& spacer = config.spacers[i];
+            const auto& spacer = config.spacers[valid_spacer_indices[i]];
 
-            // Build SearchConfig for this spacer
-            SearchConfig single_config;
-            single_config.pattern = spacer.sequence;
-            single_config.threshold = config.threshold;
-            single_config.prefer_gpu = config.prefer_gpu;
-            single_config.search_both_strands = config.search_both_strands;
-            single_config.forward_only = config.forward_only;
-            single_config.reverse_only = config.reverse_only;
-            single_config.compute_mismatches = config.compute_mismatches;
-            single_config.compute_scores = config.compute_scores;
-            single_config.pam = config.pam;
-            single_config.max_hits = config.max_hits_per_spacer;
+            SearchConfig single_config = make_spacer_config(config, spacer);
 
             SearchResult result;
 
@@ -1881,7 +1901,7 @@ BatchSearchResult search_genome_batch(const BatchSearchConfig& config,
             // Verbose output (thread-safe)
             if (config.verbose) {
                 std::lock_guard<std::mutex> lock(output_mutex);
-                std::cerr << "[" << done << "/" << num_spacers
+                std::cerr << "[" << done << "/" << num_valid
                           << "] Completed: " << spacer.name
                           << " (" << batch_result.spacer_results[i].result.hits.size()
                           << " hits)\n";

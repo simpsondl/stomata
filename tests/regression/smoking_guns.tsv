@@ -1,0 +1,34 @@
+# Smoking-gun spacer fixture for regression testing.
+#
+# Each spacer is one that exposed (or, for new entries, COULD have exposed)
+# a past correctness bug. A future Stomata build that fails to reproduce the
+# expected_lev_ngg_hits / expected_acfd values is suspect.
+#
+# Tolerance: ±1% on hit counts (allows for genome version / strand-dedup
+# tie-break differences across builds), ±5% on aCFD (which is sensitive to
+# tiny CFD-position-weight differences).
+#
+# Format: tab-separated, # comment lines OK.
+# Columns:
+#   spacer_name             — descriptive id
+#   sequence                — 20-nt protospacer (no PAM)
+#   expected_ham_ngg_hits   — reference: Hamming + NGG, threshold 3, hg38.p14
+#   expected_lev_ngg_hits   — reference: Lev + NGG, threshold 3, hg38.p14
+#   expected_acfd           — reference: aggregate_cfd from spacer-summary
+#   expected_sdr1_sites     — reference: n_sdr1_sites
+#   notes                   — what bug class this exposes / context
+#
+# Reference build: v0.10.0 (post-2026-04-26 alt-tl alignment re-derivation
+#   fix). Note: aCFD values for several spacers DROPPED between v0.9.0 and
+#   v0.10.0 because Bug #4 (mixed-provenance alignment display) inflated
+#   them. The values here are the corrected ones.
+# Reference genome: GRCh38.p14 canonical, .stomata index.
+#
+spacer_name	sequence	expected_ham_ngg_hits	expected_lev_ngg_hits	expected_acfd	expected_sdr1_sites	notes
+alu_suffix_ngg_v080_repro	GGCAGCCTCCTACTCCTGGG	40	223	1.95897	3	"Original v0.8.0 reproducer. Alu-repeat NTC whose 3' GGG matches NGG, exposing the widened-PAM-filter false-positive bug. Hamming/Lev disagreement (40 vs 10,481 under v0.7.1) was the first signal. Under v0.8.0 the false positives are removed; Lev hits drop from 10,481 → 223. aCFD stable v0.8.0 → v0.10.0 (no canonical-vs-alt-tl PAM mixing for this spacer)."
+crispri_smoking_gun	GAACCTTGGGAGCAGCGAGG	NA	381	0.111888	1	"hCRISPRi-v2 NTC (sgid non-targeting_01600) with measured γ = -0.109 in Horlbeck K562. Mechanistically a CRISPRi smoking gun via SDR rank. v0.10.0 aCFD dropped 10× from v0.9.0's 1.11 because Bug #4 was inflating the contribution from hits whose alt-tl alignment was the matching one. Still NOT promiscuous by aCFD threshold (4.8). n_sdr1_sites also dropped (2→1) because re-derived alignments at higher d push some hits out of the seed-≤1 band."
+alu_consensus_promiscuous	CACCTGTAATCCCAGCTACT	NA	NA	183144	NA	"Alu consensus spacer; bona-fide promiscuous (literally an Alu repeat, hits hundreds of thousands of Alu copies). Verifies that genuine high-acfd cases survive every fix. v0.10.0 aCFD dropped ~20% from v0.9.0's 229,355 — Bug #4 was inflating CFD contribution from a substantial fraction of hits. Still trivially promiscuous (acfd ≫ 4.8). NA = too many hits to track exactly; bracket [150K, 220K]."
+gecko_v2_top_promiscuous	TCCCAAAGTGCTGGGATTAC	NA	NA	461138	NA	"Top promiscuous in GeCKOv2 v0.10.0 perspacer; targets miRNA hsa-mir-3929. v0.10.0 aCFD essentially unchanged from v0.9.0 (462106 → 461138; 0.2% drop) — for this Alu-derived spacer, hits are dominated by canonical-tl alignments where Bug #4 didn't apply. Sanity check that real miRNA-targeting guides still flag as promiscuous."
+mirna_target_offender	CACCTGTAGTCCCAGCTACT	NA	NA	184021	NA	"GeCKOv2 spacer for hsa-mir-1273a. v0.10.0 aCFD dropped ~17% from v0.9.0's 222,385 — Bug #4 inflation. Orthogonal check that miRNA-promiscuity finding (Fig 6C) replicates."
+short_clean_aavs1	GTCACCAATCCTGTCCCTAG	NA	NA	1	1	"AAVS1_site_1 from the CHANGE-seq cohort. A clean targeting guide; aCFD should be small and stable across builds. v0.10.0 acfd = 1 (essentially the perfect on-target match alone). n_sdr1_sites = 1."
+homopolymer_a	AAAAAAAAAAAAAAAAAAAA	NA	NA	33449.8	NA	"Pathological homopolymer (one of the synthetic edge cases in cross_tool_spacers.txt). Past versions saw alignment-ambiguity-driven divergence with SWOffinder on these. v0.10.0 aCFD = 33,449.8 (down ~30% from v0.9.0's 47,637.6 — Bug #4 inflation was substantial for this case). Catches dedup / tie-break regressions."

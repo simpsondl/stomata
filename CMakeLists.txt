@@ -1,5 +1,9 @@
 cmake_minimum_required(VERSION 3.20)
-project(Stomata VERSION 0.11.0 LANGUAGES CXX CUDA)
+project(Stomata VERSION 0.11.0 LANGUAGES CXX)
+
+option(STOMATA_ENABLE_CUDA "Build NVIDIA GPU acceleration" ON)
+option(STOMATA_BUILD_VALIDATION "Build optional cross-tool and biological evaluation tools" OFF)
+include(CTest)
 
 # C++17 required
 # Use explicit compiler flags for C++ to avoid CMake's feature-mapping
@@ -21,23 +25,29 @@ set(CMAKE_CUDA_STANDARD 17)
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     set(CMAKE_CUDA_ARCHITECTURES "70;75;80;86;89;90")
 endif()
+if(STOMATA_ENABLE_CUDA)
+    enable_language(CUDA)
+    find_package(CUDAToolkit 11.8 REQUIRED)
+endif()
 
 # Find dependencies
 find_package(spdlog REQUIRED)
 find_package(ZLIB REQUIRED)
-find_package(CUDAToolkit REQUIRED)
 find_package(Threads REQUIRED)
-find_package(Catch2 3 QUIET)
+if(BUILD_TESTING)
+    find_package(Catch2 3 REQUIRED)
+endif()
 
 # Include directories
 include_directories(include)
 
 # Subdirectories
 add_subdirectory(src)
-if(Catch2_FOUND)
-    enable_testing()
+if(BUILD_TESTING)
     add_subdirectory(tests)
-else()
-    message(WARNING "Catch2 not found. Tests will not be built. Install with: conda install -c conda-forge catch2")
+endif()
+# Optional evaluation tools, built only when the validation/ tree is present.
+if(STOMATA_BUILD_VALIDATION AND EXISTS "${CMAKE_SOURCE_DIR}/validation/CMakeLists.txt")
+    add_subdirectory(validation)
 endif()
 

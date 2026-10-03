@@ -7,6 +7,21 @@
 #include <string>
 #include <vector>
 
+TEST_CASE("FASTA accepts CRLF headers, sequence lines and blank lines", "[genome_loader]") {
+    auto path = std::filesystem::temp_directory_path() / "stomata-crlf-regression.fa";
+    {
+        std::ofstream out(path, std::ios::binary);
+        out << ">chr1\r\nACGT\r\n\r\nNN\r\n>chr2 description\r\nTT\r\n";
+    }
+    auto entries = parse_fasta(path.string());
+    std::filesystem::remove(path);
+    REQUIRE(entries.size() == 2);
+    REQUIRE(entries[0].name == "chr1");
+    REQUIRE(entries[0].sequence == "ACGTNN");
+    REQUIRE(entries[1].name == "chr2");
+    REQUIRE(entries[1].sequence == "TT");
+}
+
 #ifndef TEST_DATA_DIR
 #error "TEST_DATA_DIR not defined. Set via CMake target_compile_definitions."
 #endif
