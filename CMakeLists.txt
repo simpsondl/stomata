@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(Stomata VERSION 0.11.0 LANGUAGES CXX)
+project(Stomata VERSION 1.0.0 LANGUAGES CXX)
 
 option(STOMATA_ENABLE_CUDA "Build NVIDIA GPU acceleration" ON)
 option(STOMATA_BUILD_VALIDATION "Build optional cross-tool and biological evaluation tools" OFF)

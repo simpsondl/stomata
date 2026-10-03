@@ -3,7 +3,7 @@
 GPU-accelerated CRISPR off-target sequence search, with mismatches, indels,
 and arbitrary IUPAC PAMs.
 
-**Version:** 0.11.0 - **License:** MIT - **Platform:** Linux, C++17
+**Version:** 1.0.0 - **License:** MIT - **Platform:** Linux, C++17
 
 Stomata scans a reference genome for sequences within a specified Hamming or
 Levenshtein distance of one guide or a batch of guides. It can search without
@@ -66,6 +66,6 @@ Spacer files accept a sequence per line or `name<TAB>sequence`. Use
   biological evaluations
 - [Benchmarks and plot](validation/benchmarks/README.md): four search scopes,
   recorded commands, input hashes and repeated measurements
-- [Citation](CITATION.cff)
+- [Changelog](CHANGELOG.md) - [Citation](CITATION.cff)
 
 Issues and reproducible bug reports: <https://github.com/simpsondl/stomata/issues>.

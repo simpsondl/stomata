@@ -642,7 +642,7 @@ experimental measurements of cleavage.
   author  = {Simpson, Danny and Sanjana, Neville E. and Lappalainen, Tuuli},
   title   = {Stomata: GPU-accelerated exhaustive CRISPR off-target search},
   year    = {2026},
-  version = {0.11.0},
+  version = {1.0.0},
   url     = {https://github.com/simpsondl/stomata}
 }
 ```
@@ -658,5 +658,5 @@ MIT — see [LICENSE](../LICENSE).
 
 ---
 
-**Version:** 0.11.0
+**Version:** 1.0.0
 **Authors:** Danny Simpson, Neville E. Sanjana, Tuuli Lappalainen (New York Genome Center)
