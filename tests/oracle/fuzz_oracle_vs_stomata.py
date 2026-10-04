@@ -193,9 +193,15 @@ def run_oracle(oracle_py: Path, fasta: Path, spacer_file: Path, cfg: dict,
 
 
 def canonicalize(tsv_path: Path, source: str) -> list:
-    """Read a hit TSV, return a sorted set of (spacer, chrom, start, end,
+    """Read a hit TSV, return a sorted list of (spacer, chrom, start, end,
     strand, distance) tuples. Different sources have slightly different
     columns; pick the right ones."""
+    return sorted(row[:6] for row in _read_rows(tsv_path))
+
+
+def _read_rows(tsv_path: Path) -> set:
+    """Rows as (spacer, chrom, start, end, strand, distance, spans), where
+    spans holds every optimal (start, end) when the oracle reports them."""
     rows = set()
     with tsv_path.open() as f:
         reader = csv.DictReader(f, delimiter="\t")
@@ -203,20 +209,40 @@ def canonicalize(tsv_path: Path, source: str) -> list:
         if not required <= set(reader.fieldnames or []):
             raise ValueError(f"Missing columns in {tsv_path}")
         for row in reader:
-            rows.add((row["spacer"], row["chrom"], int(row["start"]),
-                      int(row["end"]), row["strand"], int(row["distance"])))
-    return sorted(rows)
+            start, end = int(row["start"]), int(row["end"])
+            spans = {(start, end)}
+            for span in filter(None, (row.get("optimal_spans") or "").split(",")):
+                s, e = span.split("-")
+                spans.add((int(s), int(e)))
+            rows.add((row["spacer"], row["chrom"], start, end, row["strand"],
+                      int(row["distance"]), frozenset(spans)))
+    return rows
 
 
-def diff_hits(stomata_rows: list, oracle_rows: list) -> str:
-    a_set = set(stomata_rows)
-    o_set = set(oracle_rows)
-    only_stomata = sorted(a_set - o_set)
-    only_oracle = sorted(o_set - a_set)
+def compare_files(stomata_tsv: Path, oracle_tsv: Path) -> str:
+    """Diff two hit files. A Stomata hit matches an oracle hit with the same
+    spacer, chromosome, strand and distance whose optimal spans include the
+    Stomata span: co-optimal alignments of different lengths are all correct."""
+    stomata_rows = sorted(r[:6] for r in _read_rows(stomata_tsv))
+    unmatched_oracle = sorted(_read_rows(oracle_tsv), key=lambda r: r[:6])
+    n_oracle = len(unmatched_oracle)
+    only_stomata = []
+    for a in stomata_rows:
+        for i, o in enumerate(unmatched_oracle):
+            if a[:2] == o[:2] and a[4:6] == o[4:6] and (a[2], a[3]) in o[6]:
+                del unmatched_oracle[i]
+                break
+        else:
+            only_stomata.append(a)
+    return _format_diff(len(stomata_rows), n_oracle, only_stomata,
+                        [o[:6] for o in unmatched_oracle])
+
+
+def _format_diff(n_stomata: int, n_oracle: int, only_stomata: list, only_oracle: list) -> str:
     if not only_stomata and not only_oracle:
         return ""
     lines = []
-    lines.append(f"stomata has {len(a_set)} hits, oracle has {len(o_set)} hits")
+    lines.append(f"stomata has {n_stomata} hits, oracle has {n_oracle} hits")
     lines.append(f"only in stomata ({len(only_stomata)}):")
     for r in only_stomata[:30]:
         lines.append(f"  + {r}")
@@ -330,7 +356,7 @@ def main():
             stomata_rows = canonicalize(stomata_out, "stomata")
             oracle_rows = canonicalize(oracle_out, "oracle")
 
-            diff_text = diff_hits(stomata_rows, oracle_rows)
+            diff_text = compare_files(stomata_out, oracle_out)
             if not diff_text:
                 n_pass += 1
                 print(f"  {seed:>5} {cfg['distance_mode']:>12} {cfg['pam']:>8} "

@@ -382,8 +382,8 @@ spacer  chrom  start  end  pattern  distance  strand  aligned_seq  cigar  pam_se
 |--------|------|-------------|
 | `spacer` | string | Spacer name (batch mode only) |
 | `chrom` | string | Chromosome name |
-| `start` | int | 0-based start position |
-| `end` | int | 0-based exclusive end position |
+| `start` | int | 0-based start of the aligned genome span |
+| `end` | int | 0-based exclusive end of the aligned genome span |
 | `pattern` | string | Query spacer sequence |
 | `distance` | int | Edit distance (Levenshtein, even in Hamming search mode) |
 | `strand` | char | `+` (forward) or `-` (reverse) |
@@ -393,6 +393,12 @@ spacer  chrom  start  end  pattern  distance  strand  aligned_seq  cigar  pam_se
 | `alignment_ambiguous` | bool | `true` if multiple equal-cost alignments exist |
 | `n_ambiguous_cells` | int | Number of traceback cells with co-optimal ops |
 | `cfd_score` | float | CFD activity score (0.0–1.0); −1 when not computed |
+
+`start` and `end` cover the genome bases in the reported alignment, on either
+strand, so a hit with insertions or deletions can span more or fewer bases
+than the spacer. With `--no-compute-mismatches` no alignment is computed and
+the span is the spacer length ending at `end`. BED and JSON output use the
+same coordinates.
 
 ### BED
 

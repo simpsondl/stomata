@@ -22,7 +22,7 @@ Trade-offs:
     semantics — a hit needs both PAM match AND a valid alignment.
 
 Output: TSV with columns
-  spacer  chrom  start  end  strand  distance  pam_seq  target_len
+  spacer  chrom  start  end  strand  distance  pam_seq  target_len  optimal_spans
 
 Compare to Stomata's BED output by sorting both on (spacer, chrom, start,
 strand) and diffing. Bit-equivalent agreement is the success criterion;
@@ -185,6 +185,7 @@ def search_one_strand(spacer_name: str, pattern: str,
         best_d = threshold + 1
         best_tl = None
         best_pam_seq = None
+        valid = []  # (tl, d) pairs meeting both conditions
 
         for tl in range(tl_lo, tl_hi + 1):
             start = end_pos - tl + 1
@@ -219,6 +220,7 @@ def search_one_strand(spacer_name: str, pattern: str,
             else:
                 pam_seq = ""
 
+            valid.append((tl, d))
             # Both conditions hold at this tl. Track the lowest-d valid (tl, d, PAM).
             # Tie-break: prefer canonical tl == pattern_len, else smallest tl.
             if d < best_d or (
@@ -234,12 +236,16 @@ def search_one_strand(spacer_name: str, pattern: str,
         if best_d > threshold:
             continue
 
-        nominal_start = max(0, end_pos - m + 1)
+        # Every optimal target length gives an equally valid span; Stomata's
+        # traceback may report any of them.
+        spans = [(max(0, end_pos - tl + 1), end_pos + 1) for tl, d in valid if d == best_d]
         hits.append({
             "spacer": spacer_name,
             "chrom": chrom,
-            "start": nominal_start,
+            "start": max(0, end_pos - best_tl + 1),
             "end": end_pos + 1,  # half-open
+            "anchor": end_pos + 1,  # fixed end in this strand's frame
+            "spans": spans,
             "strand": strand,
             "distance": best_d,
             "pam_seq": best_pam_seq if best_pam_seq is not None else "",
@@ -310,11 +316,16 @@ def main():
                     args.distance_mode)
                 # Flip start/end coordinates back to the forward-strand frame
                 n_chrom = len(chrom_seq)
+                m = len(sp_seq)
                 for h in rc_hits:
                     fwd_start = n_chrom - h["end"]
                     fwd_end = n_chrom - h["start"]
                     h["start"] = fwd_start
                     h["end"] = fwd_end
+                    h["spans"] = [(n_chrom - e, n_chrom - s) for s, e in h["spans"]]
+                    # Dedup key: the forward end of a pattern-length window,
+                    # independent of which optimal span was reported.
+                    h["anchor"] = n_chrom - h["anchor"] + m
                 all_hits.extend(rc_hits)
 
     # Halo dedup with TRANSITIVE cluster extension (matches Stomata's
@@ -326,7 +337,7 @@ def main():
     # though 829↔833 are NOT within radius.
     if args.distance_mode == "levenshtein":
         dedup_radius = args.threshold + 1
-        all_hits.sort(key=lambda h: (h["spacer"], h["chrom"], h["strand"], h["end"], h["distance"]))
+        all_hits.sort(key=lambda h: (h["spacer"], h["chrom"], h["strand"], h["anchor"], h["distance"]))
         deduped = []
         i = 0
         while i < len(all_hits):
@@ -337,7 +348,7 @@ def main():
                     and all_hits[j]["spacer"] == all_hits[i]["spacer"] \
                     and all_hits[j]["chrom"] == all_hits[i]["chrom"] \
                     and all_hits[j]["strand"] == all_hits[i]["strand"] \
-                    and (all_hits[j]["end"] - all_hits[j-1]["end"]) < dedup_radius:
+                    and (all_hits[j]["anchor"] - all_hits[j-1]["anchor"]) < dedup_radius:
                 # Stomata's tie-break: lower distance > better PAM > rightmost.
                 # We don't track PAM priority in the oracle (it's a SpCas9
                 # heuristic for halo dedup that has nothing to do with
@@ -359,10 +370,11 @@ def main():
 
     # Emit TSV
     with args.out.open("w") as out:
-        out.write("spacer\tchrom\tstart\tend\tstrand\tdistance\tpam_seq\ttarget_len\n")
+        out.write("spacer\tchrom\tstart\tend\tstrand\tdistance\tpam_seq\ttarget_len\toptimal_spans\n")
         for h in all_hits:
+            spans = ",".join(f"{s}-{e}" for s, e in sorted(h["spans"]))
             out.write(f"{h['spacer']}\t{h['chrom']}\t{h['start']}\t{h['end']}\t"
-                      f"{h['strand']}\t{h['distance']}\t{h['pam_seq']}\t{h['target_len']}\n")
+                      f"{h['strand']}\t{h['distance']}\t{h['pam_seq']}\t{h['target_len']}\t{spans}\n")
 
     print(f"  wrote {len(all_hits):,} hits → {args.out}", file=sys.stderr)
 

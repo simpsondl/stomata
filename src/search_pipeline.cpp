@@ -566,6 +566,7 @@ static bool repopulate_hit_at_tl(
 
     hit.distance = static_cast<uint8_t>(ar.distance);
     hit.mismatch_info.cigar = format_cigar(ar.alignment);
+    hit.mismatch_info.target_len = pinned_tl;
     hit.mismatch_info.aligned_sequence =
         build_aligned_sequence_from_alignment(ar.alignment, compare_sequence, 0);
     hit.mismatch_info.alignment_is_ambiguous = ar.has_ambiguity;
@@ -833,6 +834,7 @@ static void extract_mismatch_info(const std::string& original_pattern,
         hit.mismatch_info.aligned_sequence =
             extract_aligned_region_perfect_match(compare_sequence, hit.strand, m);
         hit.mismatch_info.cigar = std::to_string(m) + "M";
+        hit.mismatch_info.target_len = m;
         return;
     }
 
@@ -848,6 +850,7 @@ static void extract_mismatch_info(const std::string& original_pattern,
         if (op == AlignOp::MATCH || op == AlignOp::INS_TEXT) ++text_consumed;
     }
     const size_t align_text_start = ar.best_j - text_consumed;
+    hit.mismatch_info.target_len = text_consumed;
 
     // v0.7.0: extract PAM using the actual aligned-target length (text_consumed),
     // which may differ from the nominal pattern length m when target-side bulges
@@ -1155,6 +1158,11 @@ SearchResult search_genome(const SearchConfig& config, GenomeView view) {
     return result;
 }
 
+size_t hit_start(const SearchHit& hit, size_t pattern_len) {
+    const size_t span = hit.mismatch_info.target_len ? hit.mismatch_info.target_len : pattern_len;
+    return (hit.chrom_offset + 1 >= span) ? hit.chrom_offset + 1 - span : 0;
+}
+
 // Output formatting
 
 std::string format_hits_tsv(const std::vector<SearchHit>& hits,
@@ -1168,9 +1176,7 @@ std::string format_hits_tsv(const std::vector<SearchHit>& hits,
 
     size_t pattern_len = pattern.size();
     for (const auto& hit : hits) {
-        size_t start = (hit.chrom_offset >= pattern_len - 1)
-                       ? hit.chrom_offset - pattern_len + 1
-                       : 0;
+        size_t start = hit_start(hit, pattern_len);
         size_t end = hit.chrom_offset + 1;
 
         oss << hit.chrom_name << '\t'
@@ -1196,9 +1202,7 @@ std::string format_hits_bed(const std::vector<SearchHit>& hits,
 
     size_t pattern_len = pattern.size();
     for (const auto& hit : hits) {
-        size_t start = (hit.chrom_offset >= pattern_len - 1)
-                       ? hit.chrom_offset - pattern_len + 1
-                       : 0;
+        size_t start = hit_start(hit, pattern_len);
         size_t end = hit.chrom_offset + 1;
 
         // BED score: higher is better, so use (pattern_len - distance)
@@ -1251,9 +1255,7 @@ void write_hit_body_json(std::ostringstream& oss,
                           const SearchHit& hit,
                           const std::string& pattern) {
     const size_t pattern_len = pattern.size();
-    const size_t start = (hit.chrom_offset >= pattern_len - 1)
-                        ? hit.chrom_offset - pattern_len + 1
-                        : 0;
+    const size_t start = hit_start(hit, pattern_len);
     const size_t end = hit.chrom_offset + 1;
 
     oss << "\"chrom\":\""    << json_escape(hit.chrom_name) << "\","
@@ -1946,9 +1948,7 @@ std::string format_batch_hits_tsv(const BatchSearchResult& result) {
         size_t pattern_len = pattern.size();
 
         for (const auto& hit : spacer_result.result.hits) {
-            size_t start = (hit.chrom_offset >= pattern_len - 1)
-                           ? hit.chrom_offset - pattern_len + 1
-                           : 0;
+            size_t start = hit_start(hit, pattern_len);
             size_t end = hit.chrom_offset + 1;
 
             oss << spacer_result.spacer_name << '\t'
@@ -1978,9 +1978,7 @@ std::string format_batch_hits_bed(const BatchSearchResult& result) {
         size_t pattern_len = pattern.size();
 
         for (const auto& hit : spacer_result.result.hits) {
-            size_t start = (hit.chrom_offset >= pattern_len - 1)
-                           ? hit.chrom_offset - pattern_len + 1
-                           : 0;
+            size_t start = hit_start(hit, pattern_len);
             size_t end = hit.chrom_offset + 1;
 
             // BED score: higher is better, so use (pattern_len - distance)

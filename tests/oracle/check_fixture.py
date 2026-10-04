@@ -6,7 +6,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from fuzz_oracle_vs_stomata import canonicalize, diff_hits
+from fuzz_oracle_vs_stomata import compare_files
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -40,7 +40,7 @@ def main():
             if args.cpu_only:
                 cmd += ["--cpu-only"]
             subprocess.run(cmd, check=True)
-            diff = diff_hits(canonicalize(actual, "stomata"), canonicalize(expected, "oracle"))
+            diff = compare_files(actual, expected)
             (args.output_dir / f"{label}.diff.txt").write_text(diff)
             print(f"{label}: {'FAIL' if diff else 'PASS'}", flush=True)
             failed |= bool(diff)

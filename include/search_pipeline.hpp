@@ -76,6 +76,7 @@ struct MismatchInfo {
     std::string aligned_sequence;                 // Genome sequence at hit (spacer region)
     std::string pam_sequence;                     // Extracted PAM bases (length = PamSpec extract length)
     std::string cigar;                            // M / I / D run-length CIGAR
+    size_t   target_len = 0;                      // Genome bases spanned by the alignment; 0 = not computed
 
     bool     alignment_is_ambiguous = false;      // True if multiple optimal alignments exist
     uint16_t n_ambiguous_cells      = 0;          // Traceback cells where >1 op was co-optimal
@@ -111,6 +112,11 @@ struct SearchHit {
         return strand < other.strand;
     }
 };
+
+// 0-based start of the hit's genome span. The end (chrom_offset + 1) is the
+// alignment end on both strands; the span length is the aligned target length,
+// or the pattern length when no alignment was computed.
+size_t hit_start(const SearchHit& hit, size_t pattern_len);
 
 // Configuration for a genome search.
 struct SearchConfig {

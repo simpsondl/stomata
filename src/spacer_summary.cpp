@@ -73,9 +73,7 @@ SpacerSummaryRow compute_spacer_summary(
 
         // Genomic feature overlaps
         if (!annotations.empty()) {
-            size_t start = (hit.chrom_offset >= pattern_len - 1)
-                           ? hit.chrom_offset - pattern_len + 1
-                           : 0;
+            size_t start = hit_start(hit, pattern_len);
             size_t end = hit.chrom_offset + 1;
 
             for (size_t i = 0; i < annotations.size(); ++i) {

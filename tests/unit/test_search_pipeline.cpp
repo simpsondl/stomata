@@ -3,6 +3,8 @@
 #include <genome_loader.hpp>
 
 #include <algorithm>
+#include <filesystem>
+#include <fstream>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -1093,4 +1095,59 @@ TEST_CASE("search_genome - d=0 hit does not inherit PAM from a shifted target le
         }
     }
     REQUIRE(found_end);
+}
+
+// Regression: start was always end - pattern_len + 1, so a hit whose
+// alignment spans fewer or more genome bases than the pattern reported the
+// wrong start (fuzz seed 108). Both strands must report the aligned span.
+TEST_CASE("search_genome - indel hits report the aligned genome span",
+          "[search_pipeline][coordinates]") {
+    const std::string spacer = "GAGTCCGAGCAGAAGAAGAA";
+    // Drop spacer bases 5 and 12: an 18 bp target at edit distance 2.
+    const std::string target = spacer.substr(0, 5) + spacer.substr(6, 6) + spacer.substr(13);
+    REQUIRE(target.size() == 18);
+
+    std::string background;
+    uint32_t state = 12345;
+    for (int i = 0; i < 300; ++i) {
+        state = state * 1103515245u + 12345u;
+        background += "ACGT"[(state >> 16) & 3];
+    }
+    const size_t minus_start = 100, plus_start = 200;
+    background.replace(minus_start, target.size(), reverse_complement(target));
+    background.replace(plus_start, target.size(), target);
+
+    const auto path = std::filesystem::temp_directory_path() / "stomata_indel_span.fa";
+    { std::ofstream out(path); out << ">chrT\n" << background << "\n"; }
+    Genome genome = load_fasta(path.string());
+
+    SearchConfig config;
+    config.pattern = spacer;
+    config.threshold = 2;
+    config.prefer_gpu = false;
+    SearchResult result = search_genome(config, genome);
+
+    bool found_minus = false, found_plus = false;
+    for (const auto& hit : result.hits) {
+        const size_t start = hit_start(hit, spacer.size());
+        const size_t end = hit.chrom_offset + 1;
+        if (hit.strand == Strand::MINUS && end == minus_start + target.size()) {
+            found_minus = true;
+            REQUIRE(hit.distance == 2);
+            REQUIRE(hit.mismatch_info.target_len == target.size());
+            REQUIRE(start == minus_start);
+        }
+        if (hit.strand == Strand::PLUS && end == plus_start + target.size()) {
+            found_plus = true;
+            REQUIRE(hit.distance == 2);
+            REQUIRE(start == plus_start);
+        }
+    }
+    REQUIRE(found_minus);
+    REQUIRE(found_plus);
+
+    const std::string tsv = format_hits_tsv(result.hits, spacer);
+    REQUIRE(tsv.find("chrT\t100\t118\t") != std::string::npos);
+    REQUIRE(tsv.find("chrT\t200\t218\t") != std::string::npos);
+    std::filesystem::remove(path);
 }
