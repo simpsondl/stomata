@@ -56,7 +56,7 @@ docker run --gpus all --rm -v "$PWD:/work" ghcr.io/simpsondl/stomata:v1.0.0 --ge
 For reproducible runs, replace the tag with the verified release digest:
 
 ```text
-ghcr.io/simpsondl/stomata@sha256:d5bb555d41adbe3cf92732999fa2f20b6efad7203a3bf360e4413c545514639d
+ghcr.io/simpsondl/stomata@sha256:2d8cfeb8d71caf7aaf49668614a630aa904545fffcf657f9612b33db972cde71
 ```
 
 This image passed all four quickstart cases on CPU and on an NVIDIA GTX 1660
