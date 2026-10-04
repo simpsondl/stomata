@@ -492,11 +492,13 @@ Peak memory also depends on hit density and batch size.
 ### Build / install
 
 **`STOMATA_VERSION` undefined** or generic CMake errors
+
 Verify CUDA, spdlog, and zlib are installed in the active environment.
 Conda's `compilers gxx=11 spdlog catch2` package set is the supported
 configuration.
 
 **`stomata --quickstart` fails** with hit-count mismatches
+
 Most often a CUDA SASS/architecture mismatch. The default fat-binary
 covers `sm_70;75;80;86;89;90`; for older or newer GPUs rebuild with
 `cmake -DCMAKE_CUDA_ARCHITECTURES=<your_sm> ...`. Then retry.
@@ -504,33 +506,40 @@ covers `sm_70;75;80;86;89;90`; for older or newer GPUs rebuild with
 ### Runtime errors
 
 **`Cannot open genome file: ...`**
+
 Verify the path; use absolute paths if in doubt. Stomata accepts
 `.fa`, `.fa.gz`, and `.st`.
 
 **`Invalid character in pattern: 'X'`**
+
 Spacers may contain only A/C/G/T/U/N (case-insensitive). U is normalized
 unless `--no-treat-u-as-t` is set.
 
 **`--pam requires --compute-mismatches in Levenshtein mode`**
+
 In Levenshtein mode the PAM filter relies on the alignment-validity
 re-filter inside mismatch annotation. Either keep mismatch computation
 on (default) or switch to `--distance-mode hamming`.
 
 **`Warning: CUDA not available, falling back to CPU`**
+
 GPU was not detected. Verify `nvidia-smi` works, that CUDA matches the
 toolkit you built against, and that the GPU's compute capability is in
 the SASS targets the binary was built with.
 
 **`std::bad_alloc` / out of memory**
+
 Lower `--threshold`, add `--pam`, or split into smaller batches or regions.
 Hit caps and summary formatting are not peak-memory limits.
 
 ### Performance issues
 
 **Slow first load**
+
 Build the `.st` index once (`--index-genome`); subsequent runs mmap it.
 
 **GPU slower than CPU on small queries**
+
 GPU launch overhead dominates for tiny inputs. Expected; CPU is fine for
 single-spacer / small genome runs.
 
